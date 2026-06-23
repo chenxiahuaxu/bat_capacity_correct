@@ -24,6 +24,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/stat.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * sysfs 路径常量
@@ -44,7 +45,7 @@
 #define RAW_MIN_OK         10    /* raw/100 ≥ 10% → raw 可信               */
 #define RAW_BAD_THRESHOLD  5     /* raw/100 ≤ 5% 且电压高 → raw 已损坏     */
 
-#define RECOVERY_WAIT_SEC  60    /* 恢复后等待 PMIC 重算                    */
+#define RECOVERY_WAIT_SEC  10    /* 恢复后等待 PMIC 重算                    */
 #define NORMAL_POLL_SEC    10    /* NORMAL 状态巡检间隔                      */
 #define FALLBACK_POLL_SEC  3     /* 兜底覆写间隔                            */
 
@@ -134,15 +135,60 @@ static int sysfs_write_int(const char *path, int val)
     return 0;
 }
 
-/* 写字符串到 sysfs（用于覆写 capacity 节点） */
+/* 写字符串到 sysfs（用于覆写 capacity 节点）
+ *   1. chmod 确保可写（BMS 驱动可能重置权限）
+ *   2. 先不带换行符写（兼容原方案）
+ *   3. 立刻回读验证，不匹配则带换行符重试
+ */
 static int sysfs_write_str(const char *path, const char *val)
 {
     FILE *fp;
+    int verify;
+
+    /* 确保节点可写 */
+    chmod(path, 0666);
+
+    /* 尝试 1：不带换行符 */
     fp = fopen(path, "w");
     if (!fp) return -1;
     fprintf(fp, "%s", val);
     fclose(fp);
-    return 0;
+
+    /* 回读验证 */
+    if (sysfs_read_int(path, &verify) == 0 && verify == atoi(val))
+        return 0;
+
+    /* 尝试 2：带换行符（部分内核驱动要求） */
+    chmod(path, 0666);
+    fp = fopen(path, "w");
+    if (!fp) return -1;
+    fprintf(fp, "%s\n", val);
+    fclose(fp);
+
+    if (sysfs_read_int(path, &verify) == 0 && verify == atoi(val))
+        return 0;
+
+    return -1;  /* 两种方式均被 BMS 覆盖 */
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * capacity 节点写入句柄（保持打开，同原始方案）
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static FILE *g_fp_cap = NULL;
+
+/* 写 capacity 节点 — 仿原始方案：保持 fd 打开，fprintf + fflush */
+static int write_capacity(const char *val)
+{
+    if (!g_fp_cap) return -1;
+    fprintf(g_fp_cap, "%s", val);
+    fflush(g_fp_cap);
+
+    /* 回读验证 */
+    int verify;
+    if (sysfs_read_int(SYS_CAPACITY, &verify) == 0 && verify == atoi(val))
+        return 0;
+    return -1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -329,7 +375,7 @@ static State state_normal(const SensorData *s)
     }
 
     /* 无异常：打印巡检结果，等待下一次 */
-    LOG("巡检: 系统=%d%%  raw=%d%%  电压=%dmV  充电=%s  [正常]",
+    LOG("巡检: [系统=%d%%  raw=%d%%  电压=%dmV  %s  正常]",
         s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
     sleep(NORMAL_POLL_SEC);
     return STATE_NORMAL;
@@ -399,30 +445,16 @@ static State state_recovering(SensorData *s)
 
 static State state_fallback_raw(const SensorData *s)
 {
-    static char prev_val[16] = {0};
     char cur_val[16];
 
     sprintf(cur_val, "%d", s->raw_pct);
 
-    /* 写入 (仅在值变化时，每次 fopen/fclose 确保 sysfs 生效) */
-    if (strcmp(prev_val, cur_val) != 0) {
-        if (sysfs_write_str(SYS_CAPACITY, cur_val) == 0) {
-            int verify;
-            /* 立即回读验证写入是否被 BMS 驱动覆盖 */
-            if (sysfs_read_int(SYS_CAPACITY, &verify) == 0) {
-                LOG("覆写: 写入=%s%%  回读=%d%%  raw=%d  电压=%dmV  "
-                    "充电=%s  [raw兜底]%s",
-                    cur_val, verify, s->raw_pct, s->volt_mv, s->charging,
-                    verify == atoi(cur_val) ? "" : " ← BMS已覆盖!");
-            } else {
-                LOG("覆写: 容量=%s%%  raw=%d  电压=%dmV  "
-                    "充电=%s  [raw兜底]",
-                    cur_val, s->raw_pct, s->volt_mv, s->charging);
-            }
-            strcpy(prev_val, cur_val);
-        } else {
-            LOG("覆写失败: 无法写入 %s", SYS_CAPACITY);
-        }
+    if (write_capacity(cur_val) == 0) {
+        LOG("写入: %s%%  [系统=%d%%  raw=%d  电压=%dmV  %s  raw兜底] ✓",
+            cur_val, s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
+    } else {
+        LOG("写入: %s%%  [系统=%d%%  raw=%d  电压=%dmV  %s  raw兜底] ✗",
+            cur_val, s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
     }
 
     /* 检查异常是否已自行消失 */
@@ -448,7 +480,6 @@ static State state_fallback_voltage(const SensorData *s)
     static int   volt_ema = 0;           /* 电压 EMA 平滑值               */
     static int   cap_constrained = -1;   /* 约束后的输出容量，-1=未初始化 */
     static int   prev_charging = -1;     /* 上次充电状态，-1=未初始化     */
-    static char  prev_val[16] = {0};
     char cur_val[16];
     int  is_charging;
     int  est_raw, est;
@@ -459,7 +490,8 @@ static State state_fallback_voltage(const SensorData *s)
     /* 状态切换时重置约束缓存 */
     if (prev_charging != -1 && prev_charging != is_charging) {
         cap_constrained = -1;
-        LOG("  充放电状态切换: %s → %s, 重置约束",
+        volt_ema = 0;                     /* 重置 EMA */
+        LOG("  充放电状态切换: %s → %s, 重置约束与EMA",
             prev_charging ? "充电" : "放电",
             is_charging  ? "充电" : "放电");
     }
@@ -494,25 +526,15 @@ static State state_fallback_voltage(const SensorData *s)
 
     sprintf(cur_val, "%d", est);
 
-    /* ── 4. 写入 ────────────────────────────────────────────── */
-    if (strcmp(prev_val, cur_val) != 0) {
-        if (sysfs_write_str(SYS_CAPACITY, cur_val) == 0) {
-            int verify;
-            if (sysfs_read_int(SYS_CAPACITY, &verify) == 0) {
-                LOG("覆写: 写入=%s%%  回读=%d%%  原始电压=%dmV  "
-                    "平滑=%dmV  raw=%d  充电=%s  [电压估算]%s",
-                    cur_val, verify, s->volt_mv, volt_smooth,
-                    s->raw_pct, s->charging,
-                    verify == est ? "" : " ←BMS覆盖");
-            } else {
-                LOG("覆写: 容量=%s%%  原始电压=%dmV  平滑=%dmV  "
-                    "充电=%s  [电压估算]",
-                    cur_val, s->volt_mv, volt_smooth, s->charging);
-            }
-            strcpy(prev_val, cur_val);
-        } else {
-            LOG("覆写失败: 无法写入 %s", SYS_CAPACITY);
-        }
+    /* ── 4. 写入（每次循环都尝试，不跳过） ──────────────────── */
+    if (write_capacity(cur_val) == 0) {
+        LOG("写入: %s%%  [系统=%d%%  raw=%d  %dmV→平滑%dmV→约束  %s  电压] ✓",
+            cur_val, s->cap_pct, s->raw_pct,
+            s->volt_mv, volt_smooth, s->charging);
+    } else {
+        LOG("写入: %s%%  [系统=%d%%  raw=%d  %dmV→平滑%dmV→约束  %s  电压] ✗",
+            cur_val, s->cap_pct, s->raw_pct,
+            s->volt_mv, volt_smooth, s->charging);
     }
 
     /* 检查是否可升级 */
@@ -539,6 +561,14 @@ int main(void)
     SensorData sensor;
     State state = STATE_INIT;
     State prev_state = STATE_INIT;
+
+    /* 打开 capacity 节点，保持句柄（仿原始方案） */
+    g_fp_cap = fopen(SYS_CAPACITY, "w");
+    if (!g_fp_cap) {
+        LOG("致命错误: 无法打开 %s", SYS_CAPACITY);
+        return 1;
+    }
+    LOG("已打开 capacity 写入句柄");
 
     /* 首次读取传感器 */
     if (read_sensors(&sensor) != 0) {
@@ -598,5 +628,6 @@ int main(void)
         }
     }
 
+    if (g_fp_cap) fclose(g_fp_cap);
     return 0;
 }
