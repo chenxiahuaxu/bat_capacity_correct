@@ -201,6 +201,9 @@ static int read_sensors(SensorData *s)
 
     if (sysfs_read_int(SYS_CAPACITY_RAW, &raw_raw) != 0) return -1;
     s->raw_pct = raw_raw / 100;
+    /* 钳位：BMS 异常时 raw 可能返回 INT_MIN 等溢出值 */
+    if (s->raw_pct < 0)   s->raw_pct = 0;
+    if (s->raw_pct > 100) s->raw_pct = 100;
 
     if (sysfs_read_int(SYS_VOLTAGE_NOW, &s->volt_mv) != 0) return -1;
     s->volt_mv /= 1000; /* µV → mV */
@@ -353,11 +356,12 @@ static State state_init(const SensorData *s)
         LOG("检测结果: 无异常 → 进入 NORMAL 状态（后台巡检）");
         return STATE_NORMAL;
     } else if (type == 1) {
-        LOG("检测结果: 异常类型A (raw可信) → 进入 RECOVERING 状态");
+        LOG("检测结果: 异常类型A (raw可信) → 进入 raw兜底");
+        return STATE_FALLBACK_RAW;
     } else {
-        LOG("检测结果: 异常类型B (raw已损坏) → 进入 RECOVERING 状态");
+        LOG("检测结果: 异常类型B (raw已损坏) → 进入 电压估算");
+        return STATE_FALLBACK_VOLTAGE;
     }
-    return STATE_RECOVERING;
 }
 
 /* ── STATE_NORMAL：后台巡检，不写 sysfs ────────────────────────────────── */
@@ -369,13 +373,13 @@ static State state_normal(const SensorData *s)
     if (type != 0) {
         LOG("*** 巡检发现异常！系统=%d%%  raw=%d%%  电压=%dmV ***",
             s->cap_pct, s->raw_pct, s->volt_mv);
-        LOG("*** 异常类型: %s → 进入 RECOVERING ***",
-            type == 2 ? "类型B(raw也坏)" : "类型A(raw可信)");
-        return STATE_RECOVERING;
+        LOG("*** 异常类型: %s → 进入兜底 ***",
+            type == 2 ? "类型B→电压估算" : "类型A→raw兜底");
+        return (type == 2) ? STATE_FALLBACK_VOLTAGE : STATE_FALLBACK_RAW;
     }
 
     /* 无异常：打印巡检结果，等待下一次 */
-    LOG("巡检: [系统=%d%%  raw=%d%%  电压=%dmV  %s  正常]",
+    LOG("巡检: [系统=%d%%  raw=%d%%  电压=%dmV  %s  检测=正常]",
         s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
     sleep(NORMAL_POLL_SEC);
     return STATE_NORMAL;
@@ -608,22 +612,27 @@ int main(void)
             break;
 
         case STATE_FALLBACK_RAW:
-            /* 先读最新数据，再覆写 */
-            if (read_sensors(&sensor) != 0) {
-                LOG("警告: 读传感器失败, 保持 raw兜底");
-                sleep(FALLBACK_POLL_SEC);
-                break;
-            }
-            state = state_fallback_raw(&sensor);
-            break;
-
         case STATE_FALLBACK_VOLTAGE:
+            /* 先读最新数据，再每轮独立判断走 raw 还是电压 */
             if (read_sensors(&sensor) != 0) {
-                LOG("警告: 读传感器失败, 保持 电压估算");
+                LOG("警告: 读传感器失败, 保持兜底");
                 sleep(FALLBACK_POLL_SEC);
                 break;
             }
-            state = state_fallback_voltage(&sensor);
+            {
+                int t = detect_anomaly(&sensor);
+                LOG("本轮: 系统=%d%%  raw=%d  电压=%dmV  %s  → 检测=%s  → 选择=%s",
+                    sensor.cap_pct, sensor.raw_pct, sensor.volt_mv, sensor.charging,
+                    t == 0 ? "正常" : t == 1 ? "类型A(raw可信)" : "类型B(raw坏,电压估算)",
+                    t == 0 ? "NORMAL" : t == 1 ? "raw覆写" : "电压估算");
+                if (t == 0) {
+                    state = STATE_NORMAL;
+                } else if (t == 1) {
+                    state = state_fallback_raw(&sensor);
+                } else {
+                    state = state_fallback_voltage(&sensor);
+                }
+            }
             break;
         }
     }
