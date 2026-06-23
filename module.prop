@@ -1,0 +1,7 @@
+id=bat_capacity_correct
+name=bat_capacity_correct(电池容量校正)
+version=1.0.0
+versionCode=200
+author=becase
+description=校正第三方 ROM（如 LineageOS）下电池电量显示偏差
+license=GPL-3.0
