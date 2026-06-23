@@ -14,6 +14,7 @@ LOGFILE=/data/local/tmp/bat_correct.log
 
 run_binary(){
   if [[ -f $capacity ]] && [[ -f $capacity_raw ]]; then
+    rm -f $LOGFILE
     chmod 777 $capacity
     # stderr → 日志文件, stdout 丢弃
     nohup $MODDIR/bat_capacity_correct 2>> $LOGFILE 1>/dev/null &
