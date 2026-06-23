@@ -16,4 +16,4 @@ fi
 
 # Set module directory permissions
 set_perm_recursive $MODPATH 0 0 0755 0644
-set_perm_recursive $MODPATH/bat_capacity_fix 0 0 0755 0755
+set_perm_recursive $MODPATH/bat_capacity_correct 0 0 0755 0755
