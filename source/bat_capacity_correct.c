@@ -537,18 +537,24 @@ static State state_fallback_voltage(const SensorData *s)
     else
         volt_smooth = (volt_smooth * 9 + s->volt_mv) / 10;  /* α=0.1 */
 
-    /* 电流 < 250mA 时用 OCV 修正库仑计累积误差 */
-    if (i_ma < 250) {
-        int ocv_soc = voltage_to_capacity(volt_smooth);
-        coulomb_soc = (coulomb_soc * 2 + ocv_soc) / 3;  /* OCV 33% 权重 */
-        coulomb_acc = 0;
-        trust = "校准";
-    } else if (i_ma < CUR_HIGH_TRUST) {
-        trust = "高";
-    } else if (i_ma < CUR_MED_TRUST) {
-        trust = "中";
-    } else {
-        trust = "低";
+    /* 轻载时用 OCV 闭环修正，30s 冷却防密集触发 */
+    {
+        static time_t last_ocv_cal = 0;
+        if (i_ma < 250 && time(NULL) - last_ocv_cal >= 30) {
+            int ocv_soc = voltage_to_capacity(volt_smooth);
+            int delta = ocv_soc - coulomb_soc;
+            if (delta > 1)  delta = 1;
+            if (delta < -1) delta = -1;
+            coulomb_soc += delta;
+            last_ocv_cal = time(NULL);
+            trust = "校准";
+        } else if (i_ma < CUR_HIGH_TRUST) {
+            trust = "高";
+        } else if (i_ma < CUR_MED_TRUST) {
+            trust = "中";
+        } else {
+            trust = "低";
+        }
     }
 
     /* ── 3. 单向约束 ────────────────────────────────────────── */
