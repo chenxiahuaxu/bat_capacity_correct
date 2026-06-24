@@ -637,10 +637,17 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
  *   充电时 SOC 不应下降, 放电时不应上升。
  *   充放电切换时自动重置约束。
  */
-static int constrain_step(int est_raw, int is_charging)
+static int constrain_step(int est_raw, int is_charging, int force_reset)
 {
     static int cap_constrained = -1;
     static int prev_chg        = -1;  /* 用于检测充放电切换 */
+
+    /* 强制重置（首次低负载 OCV 初始化时调用） */
+    if (force_reset) {
+        cap_constrained = est_raw;
+        prev_chg = is_charging;
+        return est_raw;
+    }
 
     /* 充放电切换时重置约束 */
     if (prev_chg != -1 && prev_chg != is_charging)
@@ -703,7 +710,10 @@ static State state_fallback_voltage(const SensorData *s)
     }
 
     /* ── 3. 单向约束 ────────────────────────────────────────── */
-    est = constrain_step(coulomb_soc, is_charging);
+    if (trust && strcmp(trust, "初始化") == 0)
+        est = constrain_step(coulomb_soc, is_charging, 1);  /* 强制接受初始化值 */
+    else
+        est = constrain_step(coulomb_soc, is_charging, 0);
 
     /* ── 4. 写入 ────────────────────────────────────────────── */
     sprintf(cur_val, "%d", est);
