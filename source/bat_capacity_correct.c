@@ -183,6 +183,7 @@ static int sysfs_write_str(const char *path, const char *val)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static FILE *g_fp_cap = NULL;
+static int   g_boot_abnormal = 0;  /* 启动时 BMS 异常则置 1，NORMAL 状态下也需持续覆写 */
 
 /* 写 capacity 节点 — 仿原始方案：保持 fd 打开，fprintf + fflush */
 static int write_capacity(const char *val)
@@ -261,6 +262,11 @@ static int detect_anomaly(const SensorData *s)
 
     /* 检查3：bms 与 raw 偏差 >3% */
     if (abs(s->bms_cap_pct - s->raw_pct) > 3)
+        return 1;
+
+    /* 检查4：系统显示与 raw 偏差 >5%，raw 可信时需覆写 */
+    if (s->raw_pct >= RAW_MIN_OK
+        && abs(s->bat_cap_pct - s->raw_pct) > 5)
         return 1;
 
     return 0;
@@ -405,14 +411,19 @@ static State state_normal(const SensorData *s)
             return STATE_FALLBACK_RAW;
     }
 
-    /* 无异常：同步 BMS 值到系统显示 + 巡检 */
-    {
+    /* 无异常 */
+    if (g_boot_abnormal) {
+        /* boot 时异常 → 即使恢复也持续同步 */
         char sync_val[16];
         sprintf(sync_val, "%d", s->bms_cap_pct);
         write_capacity(sync_val);
         LOG("巡检: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV  current_now=%dmA  status=%s  |  检测=正常  |  同步 %s%% → battery/capacity",
             s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv,
             s->current_ua / 1000, s->charging, sync_val);
+    } else {
+        LOG("巡检: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV  current_now=%dmA  status=%s  |  检测=正常",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv,
+            s->current_ua / 1000, s->charging);
     }
     sleep(NORMAL_POLL_SEC);
     return STATE_NORMAL;
@@ -737,6 +748,8 @@ int main(void)
 
         case STATE_INIT:
             state = state_init(&sensor);
+            if (state != STATE_NORMAL)
+                g_boot_abnormal = 1;
             break;
 
         case STATE_NORMAL:
