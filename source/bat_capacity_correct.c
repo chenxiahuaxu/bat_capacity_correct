@@ -2,21 +2,16 @@
  * bat_capacity_correct.c — 多阶段电池电量校正
  *
  * 状态机 / 状态机：
- *   INIT              → 初始检测，判定进入 NORMAL 还是 RECOVERING
+ *   INIT              → 初始检测，判定进入 NORMAL 或兜底
  *   NORMAL            → 无异常，只后台定时巡检，不写任何 sysfs
- *   RECOVERING        → 尝试恢复控制器，等待后重新评估
- *   FALLBACK_RAW      → 恢复失败、raw 可信：raw/100 覆写 capacity
- *   FALLBACK_VOLTAGE  → 恢复失败、raw 也坏：电压查表估算覆写
+ *   FALLBACK_RAW      → raw 可信：raw/100 覆写 battery/capacity
+ *   FALLBACK_SOC      → raw 失效、soc_decimal 有效：soc_decimal/10 覆写
+ *   FALLBACK_VOLTAGE  → raw 和 soc_decimal 都无效：电压查表估算覆写
  *
- * 转换路径：
- *   INIT → NORMAL | RECOVERING
- *   NORMAL → RECOVERING (巡检发现异常)
- *   RECOVERING → NORMAL | FALLBACK_RAW | FALLBACK_VOLTAGE
- *   FALLBACK_RAW → NORMAL (异常自行消失)
- *   FALLBACK_VOLTAGE → FALLBACK_RAW (raw 恢复可信) | NORMAL
+ * 优先级链：
+ *   raw → soc_decimal → 电压估算
  *
- * 核心原则：无异常时零干预，只在必要时介入。
- * 电压是硬件 ADC 直读的物理量，始终作为终极真值源。
+ * 写入目标：/sys/class/power_supply/battery/capacity（Android 读取的节点）
  */
 
 #include <stdio.h>
@@ -32,6 +27,8 @@
 
 #define SYS_CAPACITY_RAW  "/sys/class/power_supply/bms/capacity_raw"
 #define SYS_CAPACITY      "/sys/class/power_supply/bms/capacity"
+#define SYS_BAT_CAPACITY  "/sys/class/power_supply/battery/capacity"  /* 写入目标 */
+#define SYS_SOC_DECIMAL   "/sys/class/power_supply/bms/soc_decimal"   /* raw 失效时的备选源 (0.1%) */
 #define SYS_VOLTAGE_NOW   "/sys/class/power_supply/bms/voltage_now"
 #define SYS_STATUS        "/sys/class/power_supply/battery/status"
 #define SYS_BMS_RESET     "/sys/class/power_supply/bms/reset"
@@ -54,10 +51,11 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef enum {
-    STATE_INIT,
-    STATE_NORMAL,
+    STATE_INIT,                 // 初始化状态
+    STATE_NORMAL,               
     STATE_RECOVERING,
     STATE_FALLBACK_RAW,
+    STATE_FALLBACK_SOC,
     STATE_FALLBACK_VOLTAGE,
 } State;
 
@@ -68,6 +66,7 @@ static const char *state_name(State s)
     case STATE_NORMAL:           return "正常";
     case STATE_RECOVERING:       return "恢复中";
     case STATE_FALLBACK_RAW:     return "raw兜底";
+    case STATE_FALLBACK_SOC:     return "soc兜底";
     case STATE_FALLBACK_VOLTAGE: return "电压估算";
     default:                     return "未知";
     }
@@ -80,6 +79,7 @@ static const char *state_name(State s)
 typedef struct {
     int  cap_pct;           /* 系统 capacity   (0~100)     */
     int  raw_pct;           /* capacity_raw    (0~100)     */
+    int  soc_decimal;       /* soc_decimal (0~10000, 0.1%) raw失效后备选 */
     int  volt_mv;           /* voltage_now     (mV)        */
     char charging[16];      /* status 字符串               */
 } SensorData;
@@ -184,9 +184,9 @@ static int write_capacity(const char *val)
     fprintf(g_fp_cap, "%s", val);
     fflush(g_fp_cap);
 
-    /* 回读验证 */
+    /* 回读验证（验证的也是 battery/capacity） */
     int verify;
-    if (sysfs_read_int(SYS_CAPACITY, &verify) == 0 && verify == atoi(val))
+    if (sysfs_read_int(SYS_BAT_CAPACITY, &verify) == 0 && verify == atoi(val))
         return 0;
     return -1;
 }
@@ -207,6 +207,10 @@ static int read_sensors(SensorData *s)
 
     if (sysfs_read_int(SYS_VOLTAGE_NOW, &s->volt_mv) != 0) return -1;
     s->volt_mv /= 1000; /* µV → mV */
+
+    /* soc_decimal: QG 内部真实 SOC (0.1%)，best-effort，不强制要求 */
+    if (sysfs_read_int(SYS_SOC_DECIMAL, &s->soc_decimal) != 0)
+        s->soc_decimal = -1;
 
     if (sysfs_read_int(SYS_CAPACITY, &s->cap_pct) != 0) return -1;
 
@@ -359,7 +363,11 @@ static State state_init(const SensorData *s)
         LOG("检测结果: 异常类型A (raw可信) → 进入 raw兜底");
         return STATE_FALLBACK_RAW;
     } else {
-        LOG("检测结果: 异常类型B (raw已损坏) → 进入 电压估算");
+        if (s->soc_decimal >= 0 && s->soc_decimal <= 10000) {
+            LOG("检测结果: 异常类型B (raw已损坏, soc可用) → 进入 soc兜底");
+            return STATE_FALLBACK_SOC;
+        }
+        LOG("检测结果: 异常类型B (raw已损坏, soc也无效) → 进入 电压估算");
         return STATE_FALLBACK_VOLTAGE;
     }
 }
@@ -374,8 +382,14 @@ static State state_normal(const SensorData *s)
         LOG("*** 巡检发现异常！系统=%d%%  raw=%d%%  电压=%dmV ***",
             s->cap_pct, s->raw_pct, s->volt_mv);
         LOG("*** 异常类型: %s → 进入兜底 ***",
-            type == 2 ? "类型B→电压估算" : "类型A→raw兜底");
-        return (type == 2) ? STATE_FALLBACK_VOLTAGE : STATE_FALLBACK_RAW;
+            type == 2 ? "类型B→soc/电压估算" : "类型A→raw兜底");
+        if (type == 2) {
+            if (s->soc_decimal >= 0 && s->soc_decimal <= 10000)
+                return STATE_FALLBACK_SOC;
+            else
+                return STATE_FALLBACK_VOLTAGE;
+        }
+        return STATE_FALLBACK_RAW;
     }
 
     /* 无异常：打印巡检结果，等待下一次 */
@@ -469,6 +483,50 @@ static State state_fallback_raw(const SensorData *s)
 
     sleep(FALLBACK_POLL_SEC);
     return STATE_FALLBACK_RAW;
+}
+
+/* ── STATE_FALLBACK_SOC：soc_decimal /10 覆写 capacity ──────────────────── */
+
+/*
+ * 使用 QG 内部真实 SOC (soc_decimal, 0.1% 单位) 作为真值源。
+ * 仅在 raw 失效、soc_decimal 有效时启用。
+ */
+static State state_fallback_soc(const SensorData *s)
+{
+    /* soc_decimal 仍有效？ */
+    if (s->soc_decimal < 0 || s->soc_decimal > 10000) {
+        /* 失效了，降级到电压估算 */
+        LOG("soc_decimal 失效 (%d) → 降级到 电压估算", s->soc_decimal);
+        return STATE_FALLBACK_VOLTAGE;
+    }
+
+    char cur_val[16];
+    int soc = s->soc_decimal / 10;
+    sprintf(cur_val, "%d", soc);
+
+    if (write_capacity(cur_val) == 0) {
+        LOG("写入: %s%%  [系统=%d%%  raw=%d  soc_decimal=%d  %s  soc兜底] ✓",
+            cur_val, s->cap_pct, s->raw_pct,
+            s->soc_decimal, s->charging);
+    } else {
+        LOG("写入: %s%%  [系统=%d%%  raw=%d  soc_decimal=%d  %s  soc兜底] ✗",
+            cur_val, s->cap_pct, s->raw_pct,
+            s->soc_decimal, s->charging);
+    }
+
+    /* 检查是否可以升级 */
+    int t = detect_anomaly(s);
+    if (t == 0) {
+        LOG("*** 异常已消失 → 返回 NORMAL ***");
+        return STATE_NORMAL;
+    }
+    if (t == 1) {
+        LOG("*** raw 已恢复可信 → 切换到 raw兜底 ***");
+        return STATE_FALLBACK_RAW;
+    }
+
+    sleep(FALLBACK_POLL_SEC);
+    return STATE_FALLBACK_SOC;
 }
 
 /* ── STATE_FALLBACK_VOLTAGE：电压估算覆写 capacity ──────────────────────── */
@@ -566,13 +624,13 @@ int main(void)
     State state = STATE_INIT;
     State prev_state = STATE_INIT;
 
-    /* 打开 capacity 节点，保持句柄（仿原始方案） */
-    g_fp_cap = fopen(SYS_CAPACITY, "w");
+    /* 打开 battery/capacity 节点，保持句柄（Android 读取的节点，可写） */
+    g_fp_cap = fopen(SYS_BAT_CAPACITY, "w");
     if (!g_fp_cap) {
-        LOG("致命错误: 无法打开 %s", SYS_CAPACITY);
+        LOG("致命错误: 无法打开 %s", SYS_BAT_CAPACITY);
         return 1;
     }
-    LOG("已打开 capacity 写入句柄");
+    LOG("已打开 capacity 写入句柄 (%s)", SYS_BAT_CAPACITY);
 
     /* 首次读取传感器 */
     if (read_sensors(&sensor) != 0) {
@@ -612,8 +670,9 @@ int main(void)
             break;
 
         case STATE_FALLBACK_RAW:
+        case STATE_FALLBACK_SOC:
         case STATE_FALLBACK_VOLTAGE:
-            /* 先读最新数据，再每轮独立判断走 raw 还是电压 */
+            /* 先读最新数据，再每轮独立判断 */
             if (read_sensors(&sensor) != 0) {
                 LOG("警告: 读传感器失败, 保持兜底");
                 sleep(FALLBACK_POLL_SEC);
@@ -621,17 +680,25 @@ int main(void)
             }
             {
                 int t = detect_anomaly(&sensor);
-                LOG("本轮: 系统=%d%%  raw=%d  电压=%dmV  %s  → 检测=%s  → 选择=%s",
-                    sensor.cap_pct, sensor.raw_pct, sensor.volt_mv, sensor.charging,
-                    t == 0 ? "正常" : t == 1 ? "类型A(raw可信)" : "类型B(raw坏,电压估算)",
-                    t == 0 ? "NORMAL" : t == 1 ? "raw覆写" : "电压估算");
+                const char *choice;
                 if (t == 0) {
+                    choice = "NORMAL";
                     state = STATE_NORMAL;
                 } else if (t == 1) {
+                    choice = "raw覆写";
                     state = state_fallback_raw(&sensor);
+                } else if (sensor.soc_decimal >= 0 && sensor.soc_decimal <= 10000) {
+                    choice = "soc覆写";
+                    state = state_fallback_soc(&sensor);
                 } else {
+                    choice = "电压估算";
                     state = state_fallback_voltage(&sensor);
                 }
+                LOG("本轮: 系统=%d%%  raw=%d  soc=%d  电压=%dmV  %s  → 检测=%s  → 选择=%s",
+                    sensor.cap_pct, sensor.raw_pct, sensor.soc_decimal,
+                    sensor.volt_mv, sensor.charging,
+                    t == 0 ? "正常" : t == 1 ? "类型A(raw可信)" : "类型B(raw坏)",
+                    choice);
             }
             break;
         }
