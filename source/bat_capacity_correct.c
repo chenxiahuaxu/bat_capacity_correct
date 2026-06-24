@@ -535,11 +535,12 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
                      int *coulomb_soc,   int *volt_smooth,
                      int *volt_for_ocv,  const char **trust)
 {
-    static int discharge_ocv = 0;
-    static int charge_offset  = 0;
-    static int charge_base_ma = 0;
-    static time_t last_ocv_cal = 0;
-    static int was_charging = -1;
+    static int initialized      = 0;
+    static int discharge_ocv    = 0;
+    static int charge_offset    = 0;
+    static int charge_base_ma   = 0;
+    static time_t last_ocv_cal  = 0;
+    static int was_charging     = -1;
 
     /* EMA 平滑电压 */
     if (*volt_smooth == 0)
@@ -573,7 +574,19 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         *volt_for_ocv = *volt_smooth - dynamic_offset;
     }
 
-    /* OCV 校准 / 充电微调 */
+    /* ── 启动后首次低负载：一次性全量初始化电量 ────── */
+    if (!initialized) {
+        if (i_ma < 250 && !is_charging) {
+            *coulomb_soc = voltage_to_capacity(*volt_smooth);
+            discharge_ocv = *volt_smooth;
+            initialized = 1;
+            last_ocv_cal = time(NULL);
+            *trust = "初始化";
+        }
+        return;  /* 初始化完成前，不执行后续校准 */
+    }
+
+    /* ── 后续校准（120s 冷却，增量修正） ────────── */
     if (time(NULL) - last_ocv_cal >= 120) {
         int ocv_soc = voltage_to_capacity(*volt_for_ocv);
         int delta   = ocv_soc - *coulomb_soc;
