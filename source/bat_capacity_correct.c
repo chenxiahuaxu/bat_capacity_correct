@@ -736,7 +736,14 @@ int main(void)
                 /* ── 第3行：执行（由各状态函数输出） ──────── */
                 switch (state) {
                 case STATE_NORMAL:
-                    LOG("执行: 不写入");
+                    /* raw 刚恢复，同步 BMS 值到系统显示 */
+                    {
+                        char sync_val[16];
+                        sprintf(sync_val, "%d", sensor.bms_cap_pct);
+                        write_capacity(sync_val);
+                        LOG("执行: 同步BMS %s%% → battery/capacity",
+                            sync_val);
+                    }
                     break;
                 case STATE_FALLBACK_RAW:
                     state = state_fallback_raw(&sensor);
