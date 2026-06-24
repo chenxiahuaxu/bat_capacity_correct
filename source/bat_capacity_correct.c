@@ -557,7 +557,8 @@ static State state_fallback_voltage(const SensorData *s)
 
     /* 放电轻载时更新放电 OCV 基准 */
     static int discharge_ocv = 0;
-    static int charge_offset = 0;
+    static int charge_offset  = 0;     /* IR 偏移基准值 (mV)       */
+    static int charge_base_ma = 0;     /* 捕获偏移时的电流 (mA)    */
 
     if (i_ma < 250 && !is_charging) {
         if (discharge_ocv == 0)
@@ -566,20 +567,27 @@ static State state_fallback_voltage(const SensorData *s)
             discharge_ocv = (discharge_ocv * 9 + volt_smooth) / 10;
     }
 
-    /* 进入充电时捕获 IR 偏移：电压瞬间拉高的部分即固定误差 */
+    /* 进入充电时捕获 IR 偏移基准 + 当时的电流 */
     {
         static int was_charging = -1;
         if (was_charging == 0 && is_charging && discharge_ocv > 0) {
             int offset = s->volt_mv - discharge_ocv;
-            if (offset > 0) charge_offset = offset;
+            if (offset > 0) {
+                charge_offset  = offset;
+                charge_base_ma = i_ma;  /* 记录捕获时的电流 */
+            }
         }
         was_charging = is_charging;
     }
 
-    /* 充电时用 IR 修正后的电压做 OCV 校准 */
+    /* 充电时用 IR 修正后的电压做 OCV 校准，偏移随电流同比缩放 */
     int volt_for_ocv = volt_smooth;
-    if (is_charging && charge_offset > 0)
-        volt_for_ocv = volt_smooth - charge_offset;
+    if (is_charging && charge_offset > 0 && charge_base_ma > 0) {
+        /* offset × min(当前电流, 基准电流) / 基准电流 */
+        int scale_ma = (i_ma < charge_base_ma) ? i_ma : charge_base_ma;
+        int dynamic_offset = charge_offset * scale_ma / charge_base_ma;
+        volt_for_ocv = volt_smooth - dynamic_offset;
+    }
 
     {
         static time_t last_ocv_cal = 0;    /* 上次 OCV 校准时间 */
