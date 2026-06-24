@@ -547,13 +547,16 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
  * OCV 平滑 + IR 补偿 + 校准子步
  *   volt_smooth: EMA (α=0.1) 平滑后的端电压
  *   discharge_ocv: 放电轻载时跟踪的 OCV 基准
- *   charge_offset / charge_base_ma: 充电 IR 偏移基准
+ *   charge_offset / charge_base_ma: 充电 IR 偏移基准 (首帧 |I|≥250mA 时捕获)
  *   volt_for_ocv: IR 修正后的电压, 用于 OCV 校准
  *
+ *   初始化：
+ *     - 启动后首次 |I|<250mA 且放电 → 电压查表一次性全量初始化
+ *
  *   校准规则：
- *     - 正常校准：电流 < 250mA → 按电流比例修正 (250mA 权重 100%)
- *     - 充电微调：电流 ≥ 250mA 且充电中 → 方向只向上, 同权重公式
- *     - 冷却 120s
+ *     - |I| < 250mA        → 立刻校准, weight=100%, cap ±2%
+ *     - |I| ≥ 250mA        → 仅当距上次校准 ≥120s 时触发强校,
+ *                            weight=250*100/|I|(电流越大衰减越强), cap ±2%
  */
 static void ocv_step(int volt_mv, int i_ma, int is_charging,
                      int *coulomb_soc,   int *volt_smooth,
@@ -565,6 +568,7 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
     static int charge_base_ma   = 0;
     static time_t last_ocv_cal  = 0;
     static int was_charging     = -1;
+
 
     /* EMA 平滑电压 */
     if (*volt_smooth == 0)
@@ -580,15 +584,24 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
             discharge_ocv = (discharge_ocv * 9 + *volt_smooth) / 10;
     }
 
-    /* 进入充电时捕获 IR 偏移基准 */
+    /* 进入充电时标记等待 IR 捕获 */
     if (was_charging == 0 && is_charging && discharge_ocv > 0) {
+        /* 不在瞬态捕获，等电流上升到 meaningful 再捕获 */
+    }
+    was_charging = is_charging;
+
+    /* 首个有效充电帧：捕获 IR（仅当电流 ≥250mA，有意义的内阻测量） */
+    static int ir_captured = 0;
+    if (!is_charging)
+        ir_captured = 0;
+    if (is_charging && !ir_captured && i_ma >= 250 && discharge_ocv > 0) {
         int offset = volt_mv - discharge_ocv;
         if (offset > 0) {
             charge_offset  = offset;
             charge_base_ma = i_ma;
+            ir_captured = 1;
         }
     }
-    was_charging = is_charging;
 
     /* IR 修正后的虚拟 OCV：偏移随当前电流同比缩放 */
     *volt_for_ocv = *volt_smooth;
@@ -609,30 +622,30 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         return;  /* 初始化完成前，不执行后续校准 */
     }
 
-    /* ── 后续校准（120s 冷却，增量修正） ────────── */
-    if (time(NULL) - last_ocv_cal >= 120) {
+    /* ── 后续校准 ────────────────────────────────── */
+    if (i_ma < 250) {
+        /* 低电流：立刻校准，无冷却 */
         int ocv_soc = voltage_to_capacity(*volt_for_ocv);
         int delta   = ocv_soc - *coulomb_soc;
-        /* 电流越大修正越小；低电流时最大 100%（不放大 delta） */
+        int correction = delta;  /* weight=100, 不衰减 */
+        if (correction > 2)  correction = 2;
+        if (correction < -2) correction = -2;
+        *coulomb_soc += correction;
+        last_ocv_cal = time(NULL);
+        *trust = "校准";
+    } else if (time(NULL) - last_ocv_cal >= 120) {
+        /* 高电流且 120s 无校准 → 强校 */
+        int ocv_soc = voltage_to_capacity(*volt_for_ocv);
+        int delta   = ocv_soc - *coulomb_soc;
+        /* 电流越大修正越小 */
         int weight = 250 * 100 / (i_ma > 0 ? i_ma : 1);
         if (weight > 100) weight = 100;
-
-        /* 统一修正公式，仅触发条件不同 */
-        int fire = 0;
-        if (i_ma < 250) {
-            fire = 1;
-        } else if (is_charging && charge_offset > 0 && delta > 0) {
-            fire = 1;  /* 充电微调：方向只向上 */
-        }
-
-        if (fire) {
-            int correction = delta * weight / 100;
-            if (correction > 5)  correction = 5;
-            if (correction < -5) correction = -5;
-            *coulomb_soc += correction;
-            last_ocv_cal = time(NULL);
-            *trust = (i_ma < 250) ? "校准" : "微调";
-        }
+        int correction = delta * weight / 100;
+        if (correction > 2)  correction = 2;
+        if (correction < -2) correction = -2;
+        *coulomb_soc += correction;
+        last_ocv_cal = time(NULL);
+        *trust = "强校";
     }
 }
 
