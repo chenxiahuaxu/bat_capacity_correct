@@ -626,7 +626,10 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         }
 
         if (fire) {
-            *coulomb_soc += delta * weight / 100;
+            int correction = delta * weight / 100;
+            if (correction > 5)  correction = 5;
+            if (correction < -5) correction = -5;
+            *coulomb_soc += correction;
             last_ocv_cal = time(NULL);
             *trust = (i_ma < 250) ? "校准" : "微调";
         }
