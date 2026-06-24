@@ -588,6 +588,9 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
     if (was_charging == 0 && is_charging && discharge_ocv > 0) {
         /* 不在瞬态捕获，等电流上升到 meaningful 再捕获 */
     }
+    /* 充放电切换时重置 EMA，避免电压滞后 */
+    if (was_charging != -1 && was_charging != is_charging)
+        *volt_smooth = volt_mv;
     was_charging = is_charging;
 
     /* 首个有效充电帧：捕获 IR（仅当电流 ≥250mA，有意义的内阻测量） */
