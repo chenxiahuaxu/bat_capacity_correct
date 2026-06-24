@@ -361,18 +361,26 @@ static void do_recovery(void)
 
 /* ── STATE_INIT：初始检测 ──────────────────────────────────────────────── */
 
-static State state_init(const SensorData *s)
+static State state_init(SensorData *s)
 {
-    int type = detect_anomaly(s);
-
     LOG("╔════════════════════════════════════════╗");
     LOG("║  bat_capacity_correct 服务启动         ║");
     LOG("╚════════════════════════════════════════╝");
     LOG("初始读数: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV  status=%s",
         s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv, s->charging);
+    LOG("等待 BMS 初始化 (10s)...");
+    sleep(10);
+
+    if (read_sensors(s) != 0)
+        LOG("警告: BMS 初始化后传感器读取失败");
+
+    LOG("BMS 初始化后: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV  status=%s",
+        s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv, s->charging);
+
+    int type = detect_anomaly(s);
 
     if (type == 0) {
-        LOG("检测结果: 无异常 → 进入 NORMAL 状态（后台巡检）");
+        LOG("检测结果: 无异常 → 进入 NORMAL 状态");
         return STATE_NORMAL;
     } else if (type == 1) {
         LOG("检测结果: 异常类型A (raw可信) → 进入 raw兜底");
@@ -383,7 +391,7 @@ static State state_init(const SensorData *s)
     }
 }
 
-/* ── STATE_NORMAL：后台巡检，不写 sysfs ────────────────────────────────── */
+/* ── STATE_NORMAL：同步 BMS → 系统显示 + 巡检 ────────────────────────── */
 
 static State state_normal(const SensorData *s)
 {
@@ -397,10 +405,15 @@ static State state_normal(const SensorData *s)
             return STATE_FALLBACK_RAW;
     }
 
-    /* 无异常：打印巡检结果，等待下一次 */
-    LOG("巡检: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV  current_now=%dmA  status=%s  |  检测=正常",
-        s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv,
-        s->current_ua / 1000, s->charging);
+    /* 无异常：同步 BMS 值到系统显示 + 巡检 */
+    {
+        char sync_val[16];
+        sprintf(sync_val, "%d", s->bms_cap_pct);
+        write_capacity(sync_val);
+        LOG("巡检: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV  current_now=%dmA  status=%s  |  检测=正常  |  同步 %s%% → battery/capacity",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv,
+            s->current_ua / 1000, s->charging, sync_val);
+    }
     sleep(NORMAL_POLL_SEC);
     return STATE_NORMAL;
 }
@@ -759,7 +772,7 @@ int main(void)
 
                 /* ── 第2行：检测结果 + 选择方案 ────────────── */
                 if (t == 0) {
-                    LOG("判断: 检测=正常  →  选择 NORMAL（不写入）");
+                    LOG("判断: 检测=正常  →  选择 NORMAL（同步BMS）");
                     new_state = STATE_NORMAL;
                 } else if (t == 1) {
                     LOG("判断: 检测=类型A(raw可信)  →  选择 raw覆写");
