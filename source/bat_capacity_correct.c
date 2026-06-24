@@ -487,151 +487,131 @@ static State state_fallback_raw(const SensorData *s)
  * 电压估算策略 / 电压估算策略：
  *   库仑计数 + OCV 校准（TI/ADI/MPS 专业电量计同款方案）：
  *     1. 库仑计数：ΔSOC = ∫I·dt / 满容量，不受电压噪声影响，准确跟踪变化量
- *     2. OCV 校准：电流 < 100mA 时记录真实开路电压 → 修正库仑计数的累积误差
+ *     2. OCV 校准：空闲时用开路电压修正库仑计累积误差
  *     3. 电流越大，库仑计数权重越高；电流越小，OCV 校准越活跃
  */
-static State state_fallback_voltage(const SensorData *s)
+/* ── 库仑计参数（宏放函数外以便子函数引用） ──────── */
+#define CHARGE_FULL_UAH 4820000LL
+#define UAS_PER_PCT     (CHARGE_FULL_UAH * 36LL)  /* µA·s per 1% SOC */
+
+/*
+ * 库仑计数子步
+ *   原理: SOC 变化量 = 累计电流×时间 / 电池满容量
+ *     UAS_PER_PCT = 4820000 µAh × 36 = 173,520,000 µA·s (每 1% SOC 对应的电荷量)
+ *     例: 2000mA 充电, 每 3s 累计 6,000,000 µA·s → 约 29 轮(87s) 才变化 1%
+ *         500mA 充电, 每 3s 累计 1,500,000 µA·s → 约 116 轮(348s) 才变化 1%
+ */
+static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
 {
-    /* ── 库仑计参数 ──────────────────────────────────────── */
-#define CHARGE_FULL_UAH 4820000LL           /* µAh, 电池满容量         */
-#define UAS_PER_PCT     (CHARGE_FULL_UAH * 36LL) /* µA·s per 1% SOC  */
+    static int64_t coulomb_acc = 0;
 
-    static int64_t coulomb_acc = 0;         /* 累计 µA·s                  */
-    static int     coulomb_soc = -1;        /* 库仑计 SOC (×1%)           */
-    static int     volt_smooth  = 0;        /* EMA 平滑后的 OCV (mV)      */
-    static int     cap_constrained = -1;    /* 单向约束后的输出容量        */
-    static int     prev_charging = -1;      /* 上次充电状态                */
-    char cur_val[16];
-    int  is_charging, i_ma, est_raw, est;
-    int  trust_set = 0;
-    const char *trust;
-
-    /* 判断充电状态 */
-    is_charging = (s->charging[0] == 'C' || s->charging[0] == 'c');
-    i_ma = abs(s->current_ua) / 1000;
-
-    /* 充放电切换时重置约束 */
-    if (prev_charging != -1 && prev_charging != is_charging) {
-        cap_constrained = -1;
-    }
-    prev_charging = is_charging;
-
-    /* ── 1. 库仑计数：累积电流 → SOC 变化 ─────────────────── */
-    /*
-     * 原理: SOC 变化量 = 累计电流×时间 / 电池满容量
-     *   UAS_PER_PCT = 4820000 µAh × 36 = 173,520,000 µA·s (每 1% SOC 对应的电荷量)
-     *   例: 2000mA 充电, 每 3s 累计 6,000,000 µA·s → 约 29 轮(87s) 才变化 1%
-     *       500mA 充电, 每 3s 累计 1,500,000 µA·s → 约 116 轮(348s) 才变化 1%
-     *   库仑计数物理上准确，但 SOC 变化慢——需要 OCV 校准辅助绝对定位。
-     */
-    if (coulomb_soc < 0) {
-        /* 首次运行：电压查表估算初始 SOC，后续由库仑计接管 */
-        coulomb_soc = voltage_to_capacity(s->volt_mv);
+    if (*coulomb_soc < 0) {
+        *coulomb_soc = voltage_to_capacity(volt_mv);
         coulomb_acc = 0;
     }
-
-    coulomb_acc += (int64_t)s->current_ua * FALLBACK_POLL_SEC;
+    coulomb_acc += (int64_t)current_ua * FALLBACK_POLL_SEC;
     int soc_delta = (int)(coulomb_acc / UAS_PER_PCT);
     if (soc_delta != 0) {
-        coulomb_soc -= soc_delta;  /* 正电流=放电, SOC 递减; 负电流=充电, SOC 递增 */
-        coulomb_acc -= (int64_t)soc_delta * UAS_PER_PCT;  /* 只扣除已转化为 SOC 的部分 */
+        *coulomb_soc -= soc_delta;  /* 正电流=放电, SOC 递减; 负=充电, 递增 */
+        coulomb_acc -= (int64_t)soc_delta * UAS_PER_PCT;
     }
-    if (coulomb_soc < 0)   coulomb_soc = 0;
-    if (coulomb_soc > 100) coulomb_soc = 100;
+    if (*coulomb_soc < 0)   *coulomb_soc = 0;
+    if (*coulomb_soc > 100) *coulomb_soc = 100;
+}
 
-    /* ── 2. OCV 平滑 + 校准 ────────────────────────────────── */
-    /*
-     * volt_smooth: EMA (α=0.1) 平滑后的端电压。
-     *
-     * 充电时电压因 IR 压降偏高，用"放电 OCV"做基准算出 IR 偏移量，
-     * 充电期间统一扣除此偏移，得到修正后的虚拟 OCV 用于校准。
-     *
-     * OCV 校准规则：
-     *   - 触发：电流 < 250mA（单次即可）+ 距上次 ≥ 120s
-     *   - 幅度：按电流比例缩放 — 0mA 全量修正, 250mA 修正归零
-     *   - 原理：电流越小 OCV 越准，修正力度越大
-     */
-    if (volt_smooth == 0)
-        volt_smooth = s->volt_mv;
-    else
-        volt_smooth = (volt_smooth * 9 + s->volt_mv) / 10;  /* α=0.1 */
-
-    /* 放电轻载时更新放电 OCV 基准 */
+/*
+ * OCV 平滑 + IR 补偿 + 校准子步
+ *   volt_smooth: EMA (α=0.1) 平滑后的端电压
+ *   discharge_ocv: 放电轻载时跟踪的 OCV 基准
+ *   charge_offset / charge_base_ma: 充电 IR 偏移基准
+ *   volt_for_ocv: IR 修正后的电压, 用于 OCV 校准
+ *
+ *   校准规则：
+ *     - 正常校准：电流 < 250mA → 按电流比例修正 (250mA 权重 100%)
+ *     - 充电微调：电流 ≥ 250mA 且充电中 → 方向只向上, 同权重公式
+ *     - 冷却 120s
+ */
+static void ocv_step(int volt_mv, int i_ma, int is_charging,
+                     int *coulomb_soc,   int *volt_smooth,
+                     int *volt_for_ocv,  const char **trust)
+{
     static int discharge_ocv = 0;
-    static int charge_offset  = 0;     /* IR 偏移基准值 (mV)       */
-    static int charge_base_ma = 0;     /* 捕获偏移时的电流 (mA)    */
+    static int charge_offset  = 0;
+    static int charge_base_ma = 0;
+    static time_t last_ocv_cal = 0;
+    static int was_charging = -1;
 
+    /* EMA 平滑电压 */
+    if (*volt_smooth == 0)
+        *volt_smooth = volt_mv;
+    else
+        *volt_smooth = (*volt_smooth * 9 + volt_mv) / 10;  /* α=0.1 */
+
+    /* 放电轻载时更新 OCV 基准 */
     if (i_ma < 250 && !is_charging) {
         if (discharge_ocv == 0)
-            discharge_ocv = volt_smooth;
+            discharge_ocv = *volt_smooth;
         else
-            discharge_ocv = (discharge_ocv * 9 + volt_smooth) / 10;
+            discharge_ocv = (discharge_ocv * 9 + *volt_smooth) / 10;
     }
 
-    /* 进入充电时捕获 IR 偏移基准 + 当时的电流 */
-    {
-        static int was_charging = -1;
-        if (was_charging == 0 && is_charging && discharge_ocv > 0) {
-            int offset = s->volt_mv - discharge_ocv;
-            if (offset > 0) {
-                charge_offset  = offset;
-                charge_base_ma = i_ma;  /* 记录捕获时的电流 */
-            }
+    /* 进入充电时捕获 IR 偏移基准 */
+    if (was_charging == 0 && is_charging && discharge_ocv > 0) {
+        int offset = volt_mv - discharge_ocv;
+        if (offset > 0) {
+            charge_offset  = offset;
+            charge_base_ma = i_ma;
         }
-        was_charging = is_charging;
     }
+    was_charging = is_charging;
 
-    /* 充电时用 IR 修正后的电压做 OCV 校准，偏移随电流同比缩放 */
-    int volt_for_ocv = volt_smooth;
+    /* IR 修正后的虚拟 OCV：偏移随当前电流同比缩放 */
+    *volt_for_ocv = *volt_smooth;
     if (is_charging && charge_offset > 0 && charge_base_ma > 0) {
-        /* offset × min(当前电流, 基准电流) / 基准电流 */
         int scale_ma = (i_ma < charge_base_ma) ? i_ma : charge_base_ma;
         int dynamic_offset = charge_offset * scale_ma / charge_base_ma;
-        volt_for_ocv = volt_smooth - dynamic_offset;
+        *volt_for_ocv = *volt_smooth - dynamic_offset;
     }
 
-    {
-        static time_t last_ocv_cal = 0;
+    /* OCV 校准 / 充电微调 */
+    if (time(NULL) - last_ocv_cal >= 120) {
+        int ocv_soc = voltage_to_capacity(*volt_for_ocv);
+        int delta   = ocv_soc - *coulomb_soc;
+        /* 电流越大修正越小, 无上限: 250mA→100%, 125mA→200%, 1mA→25000% */
+        int weight = 250 * 100 / (i_ma > 0 ? i_ma : 1);
 
-        if (time(NULL) - last_ocv_cal >= 120) {
-            int ocv_soc = voltage_to_capacity(volt_for_ocv);
-            int delta   = ocv_soc - coulomb_soc;
-            /* 电流越大修正越小: 250mA→100%, 500mA→50%, 2500mA→10% */
-            int weight = 250 * 100 / (i_ma > 0 ? i_ma : 1);
-            if (weight > 100) weight = 100;
-
-            if (i_ma < 250) {
-                /* 正常校准 */
-                coulomb_soc += delta * weight / 100;
-                last_ocv_cal = time(NULL);
-                trust = "校准"; trust_set = 1;
-            } else if (is_charging && charge_offset > 0) {
-                /* 充电微调：方向只向上 */
-                if (delta > 0) {
-                    coulomb_soc += delta * weight / 100;
-                    last_ocv_cal = time(NULL);
-                    trust = "微调"; trust_set = 1;
-                }
-            }
+        /* 统一修正公式，仅触发条件不同 */
+        int fire = 0;
+        if (i_ma < 250) {
+            fire = 1;
+        } else if (is_charging && charge_offset > 0 && delta > 0) {
+            fire = 1;  /* 充电微调：方向只向上 */
         }
 
-        if (!trust_set) {
-            if (i_ma < CUR_HIGH_TRUST) {
-                trust = "高";
-            } else if (i_ma < CUR_MED_TRUST) {
-                trust = "中";
-            } else {
-                trust = "低";
-            }
+        if (fire) {
+            *coulomb_soc += delta * weight / 100;
+            last_ocv_cal = time(NULL);
+            *trust = (i_ma < 250) ? "校准" : "微调";
         }
+    }
+}
 
-    /* ── 3. 单向约束（物理防抖）─────────────────────────────── */
-    /*
-     * 基于物理事实：充电时 SOC 不应下降，放电时 SOC 不应上升。
-     * 充放电切换时自动重置约束（允许反向）。
-     */
-    est_raw = coulomb_soc;
+/*
+ * 单向约束子步
+ *   充电时 SOC 不应下降, 放电时不应上升。
+ *   充放电切换时自动重置约束。
+ */
+static int constrain_step(int est_raw, int is_charging)
+{
+    static int cap_constrained = -1;
+    static int prev_chg        = -1;  /* 用于检测充放电切换 */
 
+    /* 充放电切换时重置约束 */
+    if (prev_chg != -1 && prev_chg != is_charging)
+        cap_constrained = -1;
+    prev_chg = is_charging;
+
+    int est;
     if (cap_constrained < 0) {
         est = est_raw;
     } else if (is_charging) {
@@ -648,10 +628,49 @@ static State state_fallback_voltage(const SensorData *s)
     cap_constrained = est;
     if (est > 100) est = 100;
     if (est < 0)   est = 0;
+    return est;
+}
 
-    sprintf(cur_val, "%d", est);
+/* ── STATE_FALLBACK_VOLTAGE（编排器） ──────────────────────── */
+static State state_fallback_voltage(const SensorData *s)
+{
+    static int coulomb_soc    = -1;     /* 库仑计 SOC         */
+    static int volt_smooth    = 0;      /* EMA 平滑电压       */
+    char  cur_val[16];
+    int   is_charging, i_ma, est;
+    const char *trust = NULL;
+
+    /* 充放电判断 */
+    is_charging = (s->charging[0] == 'C' || s->charging[0] == 'c');
+    i_ma = abs(s->current_ua) / 1000;
+
+    /* 充放电切换时重置——通过 constrain_step 内部的静态 cap_constrained 完成 */
+    static int prev_chg_for_constraint = -1;
+    if (prev_chg_for_constraint != -1 && prev_chg_for_constraint != is_charging) {
+        /* cap_constrained 在 constrain_step 内部, 这里不需要显式重置 */
+    }
+    prev_chg_for_constraint = is_charging;
+
+    /* ── 1. 库仑计数 ────────────────────────────────────────── */
+    coulomb_step(s->current_ua, s->volt_mv, &coulomb_soc);
+
+    /* ── 2. OCV 平滑 + IR 补偿 + 校准 ───────────────────────── */
+    int volt_for_ocv;
+    ocv_step(s->volt_mv, i_ma, is_charging,
+             &coulomb_soc, &volt_smooth, &volt_for_ocv, &trust);
+
+    /* 未触发校准/微调时, 按电流分级设置信任标签 */
+    if (trust == NULL) {
+        if (i_ma < CUR_HIGH_TRUST)      trust = "高";
+        else if (i_ma < CUR_MED_TRUST)  trust = "中";
+        else                            trust = "低";
+    }
+
+    /* ── 3. 单向约束 ────────────────────────────────────────── */
+    est = constrain_step(coulomb_soc, is_charging);
 
     /* ── 4. 写入 ────────────────────────────────────────────── */
+    sprintf(cur_val, "%d", est);
     int ok = (write_capacity(cur_val) == 0);
 
     LOG("执行: 写入 %s%% → battery/capacity  %s  [now=%dmV  OCV=%dmV  库仑=%d%%  |I|=%dmA  %s]",
