@@ -569,8 +569,7 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
     /* IR 修正后的虚拟 OCV：偏移随当前电流同比缩放 */
     *volt_for_ocv = *volt_smooth;
     if (is_charging && charge_offset > 0 && charge_base_ma > 0) {
-        int scale_ma = (i_ma < charge_base_ma) ? i_ma : charge_base_ma;
-        int dynamic_offset = charge_offset * scale_ma / charge_base_ma;
+        int dynamic_offset = charge_offset * i_ma / charge_base_ma;
         *volt_for_ocv = *volt_smooth - dynamic_offset;
     }
 
