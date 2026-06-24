@@ -503,6 +503,7 @@ static State state_fallback_voltage(const SensorData *s)
     static int     prev_charging = -1;      /* 上次充电状态                */
     char cur_val[16];
     int  is_charging, i_ma, est_raw, est;
+    int  trust_set = 0;
     const char *trust;
 
     /* 判断充电状态 */
@@ -545,10 +546,10 @@ static State state_fallback_voltage(const SensorData *s)
      * 充电时电压因 IR 压降偏高，用"放电 OCV"做基准算出 IR 偏移量，
      * 充电期间统一扣除此偏移，得到修正后的虚拟 OCV 用于校准。
      *
-     * OCV 校准参数：
-     *   触发条件：电流 < 250mA 持续 3 轮(9s) + 距上次校准 ≥ 120s
-     *   幅度限制：每次最多 ±1%（防止电压查表偏差拉歪库仑值）
-     *   充放电均允许校准——充电时使用 IR 修正后的电压
+     * OCV 校准规则：
+     *   - 触发：电流 < 250mA（单次即可）+ 距上次 ≥ 120s
+     *   - 幅度：按电流比例缩放 — 0mA 全量修正, 250mA 修正归零
+     *   - 原理：电流越小 OCV 越准，修正力度越大
      */
     if (volt_smooth == 0)
         volt_smooth = s->volt_mv;
@@ -590,33 +591,39 @@ static State state_fallback_voltage(const SensorData *s)
     }
 
     {
-        static time_t last_ocv_cal = 0;    /* 上次 OCV 校准时间 */
-        static int    low_i_count  = 0;    /* 连续低电流计数    */
+        static time_t last_ocv_cal = 0;
 
-        if (i_ma < 250) {
-            low_i_count++;
-        } else {
-            low_i_count = 0;
-        }
-
-        if (low_i_count >= 3
-            && time(NULL) - last_ocv_cal >= 120) {
+        if (time(NULL) - last_ocv_cal >= 120) {
             int ocv_soc = voltage_to_capacity(volt_for_ocv);
-            int delta = ocv_soc - coulomb_soc;
-            if (delta > 1)  delta = 1;   /* 封顶 ±1% */
-            if (delta < -1) delta = -1;
-            coulomb_soc += delta;
-            last_ocv_cal = time(NULL);
-            low_i_count  = 0;
-            trust = "校准";
-        } else if (i_ma < CUR_HIGH_TRUST) {
-            trust = "高";
-        } else if (i_ma < CUR_MED_TRUST) {
-            trust = "中";
-        } else {
-            trust = "低";
+            int delta   = ocv_soc - coulomb_soc;
+            /* 电流越大修正越小: 250mA→100%, 500mA→50%, 2500mA→10% */
+            int weight = 250 * 100 / (i_ma > 0 ? i_ma : 1);
+            if (weight > 100) weight = 100;
+
+            if (i_ma < 250) {
+                /* 正常校准 */
+                coulomb_soc += delta * weight / 100;
+                last_ocv_cal = time(NULL);
+                trust = "校准"; trust_set = 1;
+            } else if (is_charging && charge_offset > 0) {
+                /* 充电微调：方向只向上 */
+                if (delta > 0) {
+                    coulomb_soc += delta * weight / 100;
+                    last_ocv_cal = time(NULL);
+                    trust = "微调"; trust_set = 1;
+                }
+            }
         }
-    }
+
+        if (!trust_set) {
+            if (i_ma < CUR_HIGH_TRUST) {
+                trust = "高";
+            } else if (i_ma < CUR_MED_TRUST) {
+                trust = "中";
+            } else {
+                trust = "低";
+            }
+        }
 
     /* ── 3. 单向约束（物理防抖）─────────────────────────────── */
     /*
@@ -629,8 +636,14 @@ static State state_fallback_voltage(const SensorData *s)
         est = est_raw;
     } else if (is_charging) {
         est = (est_raw > cap_constrained) ? est_raw : cap_constrained;
+        if (est_raw < cap_constrained)
+            LOG("  约束: 充电中库仑=%d%% < 上限=%d%%, 保持=%d%%",
+                est_raw, cap_constrained, est);
     } else {
         est = (est_raw < cap_constrained) ? est_raw : cap_constrained;
+        if (est_raw > cap_constrained)
+            LOG("  约束: 放电中库仑=%d%% > 上限=%d%%, 保持=%d%%",
+                est_raw, cap_constrained, est);
     }
     cap_constrained = est;
     if (est > 100) est = 100;
