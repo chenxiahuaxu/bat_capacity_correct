@@ -8,7 +8,6 @@ MODDIR=${0%/*}
 
 capacity_raw=/sys/class/power_supply/bms/capacity_raw
 capacity=/sys/class/power_supply/battery/capacity
-soc_decimal=/sys/class/power_supply/bms/soc_decimal
 status=/sys/class/power_supply/battery/status
 
 LOGFILE=/data/local/tmp/bat_correct.log
@@ -17,7 +16,6 @@ run_binary(){
   if [[ -f $capacity ]] && [[ -f $capacity_raw ]]; then
     rm -f $LOGFILE
     chmod 777 $capacity
-    chmod 777 $soc_decimal 2>/dev/null
     # stderr → 日志文件, stdout 丢弃
     nohup $MODDIR/bat_capacity_correct 2>> $LOGFILE 1>/dev/null &
     echo "bat_capacity_correct: service launched, log → $LOGFILE"
