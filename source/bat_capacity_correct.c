@@ -540,21 +540,46 @@ static State state_fallback_voltage(const SensorData *s)
 
     /* ── 2. OCV 平滑 + 校准 ────────────────────────────────── */
     /*
-     * volt_smooth: EMA (α=0.1) 平滑后的端电压，近似开路电压。
-     * OCV 校准闭环修正库仑计累积误差：
+     * volt_smooth: EMA (α=0.1) 平滑后的端电压。
+     *
+     * 充电时电压因 IR 压降偏高，用"放电 OCV"做基准算出 IR 偏移量，
+     * 充电期间统一扣除此偏移，得到修正后的虚拟 OCV 用于校准。
+     *
+     * OCV 校准参数：
      *   触发条件：电流 < 250mA 持续 3 轮(9s) + 距上次校准 ≥ 120s
      *   幅度限制：每次最多 ±1%（防止电压查表偏差拉歪库仑值）
-     *   冷却时间：120s 确保 OCV 不会比库仑计更频繁变化
-     *
-     *   调参依据：
-     *   - 120s 冷却下 OCV 最多贡献 ±0.5%/分钟
-     *   - 库仑计在 2A 充放电时贡献约 ±0.7%/分钟
-     *   - 两者速率平衡，库仑计主导短期跟踪，OCV 只做缓慢纠偏
+     *   充放电均允许校准——充电时使用 IR 修正后的电压
      */
     if (volt_smooth == 0)
         volt_smooth = s->volt_mv;
     else
         volt_smooth = (volt_smooth * 9 + s->volt_mv) / 10;  /* α=0.1 */
+
+    /* 放电轻载时更新放电 OCV 基准 */
+    static int discharge_ocv = 0;
+    static int charge_offset = 0;
+
+    if (i_ma < 250 && !is_charging) {
+        if (discharge_ocv == 0)
+            discharge_ocv = volt_smooth;
+        else
+            discharge_ocv = (discharge_ocv * 9 + volt_smooth) / 10;
+    }
+
+    /* 进入充电时捕获 IR 偏移：电压瞬间拉高的部分即固定误差 */
+    {
+        static int was_charging = -1;
+        if (was_charging == 0 && is_charging && discharge_ocv > 0) {
+            int offset = s->volt_mv - discharge_ocv;
+            if (offset > 0) charge_offset = offset;
+        }
+        was_charging = is_charging;
+    }
+
+    /* 充电时用 IR 修正后的电压做 OCV 校准 */
+    int volt_for_ocv = volt_smooth;
+    if (is_charging && charge_offset > 0)
+        volt_for_ocv = volt_smooth - charge_offset;
 
     {
         static time_t last_ocv_cal = 0;    /* 上次 OCV 校准时间 */
@@ -566,8 +591,9 @@ static State state_fallback_voltage(const SensorData *s)
             low_i_count = 0;
         }
 
-        if (low_i_count >= 3 && time(NULL) - last_ocv_cal >= 120) {
-            int ocv_soc = voltage_to_capacity(volt_smooth);
+        if (low_i_count >= 3
+            && time(NULL) - last_ocv_cal >= 120) {
+            int ocv_soc = voltage_to_capacity(volt_for_ocv);
             int delta = ocv_soc - coulomb_soc;
             if (delta > 1)  delta = 1;   /* 封顶 ±1% */
             if (delta < -1) delta = -1;
