@@ -613,8 +613,9 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
     if (time(NULL) - last_ocv_cal >= 120) {
         int ocv_soc = voltage_to_capacity(*volt_for_ocv);
         int delta   = ocv_soc - *coulomb_soc;
-        /* 电流越大修正越小, 无上限: 250mA→100%, 125mA→200%, 1mA→25000% */
+        /* 电流越大修正越小；低电流时最大 100%（不放大 delta） */
         int weight = 250 * 100 / (i_ma > 0 ? i_ma : 1);
+        if (weight > 100) weight = 100;
 
         /* 统一修正公式，仅触发条件不同 */
         int fire = 0;
