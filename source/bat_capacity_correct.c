@@ -516,8 +516,15 @@ static State state_fallback_voltage(const SensorData *s)
     prev_charging = is_charging;
 
     /* ── 1. 库仑计数：累积电流 → SOC 变化 ─────────────────── */
+    /*
+     * 原理: SOC 变化量 = 累计电流×时间 / 电池满容量
+     *   UAS_PER_PCT = 4820000 µAh × 36 = 173,520,000 µA·s (每 1% SOC 对应的电荷量)
+     *   例: 2000mA 充电, 每 3s 累计 6,000,000 µA·s → 约 29 轮(87s) 才变化 1%
+     *       500mA 充电, 每 3s 累计 1,500,000 µA·s → 约 116 轮(348s) 才变化 1%
+     *   库仑计数物理上准确，但 SOC 变化慢——需要 OCV 校准辅助绝对定位。
+     */
     if (coulomb_soc < 0) {
-        /* 初始化：从电压查表获取起点 */
+        /* 首次运行：电压查表估算初始 SOC，后续由库仑计接管 */
         coulomb_soc = voltage_to_capacity(s->volt_mv);
         coulomb_acc = 0;
     }
@@ -525,28 +532,48 @@ static State state_fallback_voltage(const SensorData *s)
     coulomb_acc += (int64_t)s->current_ua * FALLBACK_POLL_SEC;
     int soc_delta = (int)(coulomb_acc / UAS_PER_PCT);
     if (soc_delta != 0) {
-        coulomb_soc -= soc_delta;  /* 正电流=放电,SOC递减 */
-        coulomb_acc -= (int64_t)soc_delta * UAS_PER_PCT;
+        coulomb_soc -= soc_delta;  /* 正电流=放电, SOC 递减; 负电流=充电, SOC 递增 */
+        coulomb_acc -= (int64_t)soc_delta * UAS_PER_PCT;  /* 只扣除已转化为 SOC 的部分 */
     }
     if (coulomb_soc < 0)   coulomb_soc = 0;
     if (coulomb_soc > 100) coulomb_soc = 100;
 
     /* ── 2. OCV 平滑 + 校准 ────────────────────────────────── */
+    /*
+     * volt_smooth: EMA (α=0.1) 平滑后的端电压，近似开路电压。
+     * OCV 校准闭环修正库仑计累积误差：
+     *   触发条件：电流 < 250mA 持续 3 轮(9s) + 距上次校准 ≥ 120s
+     *   幅度限制：每次最多 ±1%（防止电压查表偏差拉歪库仑值）
+     *   冷却时间：120s 确保 OCV 不会比库仑计更频繁变化
+     *
+     *   调参依据：
+     *   - 120s 冷却下 OCV 最多贡献 ±0.5%/分钟
+     *   - 库仑计在 2A 充放电时贡献约 ±0.7%/分钟
+     *   - 两者速率平衡，库仑计主导短期跟踪，OCV 只做缓慢纠偏
+     */
     if (volt_smooth == 0)
         volt_smooth = s->volt_mv;
     else
         volt_smooth = (volt_smooth * 9 + s->volt_mv) / 10;  /* α=0.1 */
 
-    /* 轻载时用 OCV 闭环修正，30s 冷却防密集触发 */
     {
-        static time_t last_ocv_cal = 0;
-        if (i_ma < 250 && time(NULL) - last_ocv_cal >= 30) {
+        static time_t last_ocv_cal = 0;    /* 上次 OCV 校准时间 */
+        static int    low_i_count  = 0;    /* 连续低电流计数    */
+
+        if (i_ma < 250) {
+            low_i_count++;
+        } else {
+            low_i_count = 0;
+        }
+
+        if (low_i_count >= 3 && time(NULL) - last_ocv_cal >= 120) {
             int ocv_soc = voltage_to_capacity(volt_smooth);
             int delta = ocv_soc - coulomb_soc;
-            if (delta > 1)  delta = 1;
+            if (delta > 1)  delta = 1;   /* 封顶 ±1% */
             if (delta < -1) delta = -1;
             coulomb_soc += delta;
             last_ocv_cal = time(NULL);
+            low_i_count  = 0;
             trust = "校准";
         } else if (i_ma < CUR_HIGH_TRUST) {
             trust = "高";
@@ -557,7 +584,11 @@ static State state_fallback_voltage(const SensorData *s)
         }
     }
 
-    /* ── 3. 单向约束 ────────────────────────────────────────── */
+    /* ── 3. 单向约束（物理防抖）─────────────────────────────── */
+    /*
+     * 基于物理事实：充电时 SOC 不应下降，放电时 SOC 不应上升。
+     * 充放电切换时自动重置约束（允许反向）。
+     */
     est_raw = coulomb_soc;
 
     if (cap_constrained < 0) {
