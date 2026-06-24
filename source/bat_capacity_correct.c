@@ -77,11 +77,12 @@ static const char *state_name(State s)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    int  cap_pct;           /* 系统 capacity   (0~100)     */
-    int  raw_pct;           /* capacity_raw    (0~100)     */
-    int  soc_decimal;       /* soc_decimal (0~10000, 0.1%) raw失效后备选 */
-    int  volt_mv;           /* voltage_now     (mV)        */
-    char charging[16];      /* status 字符串               */
+    int  bms_cap_pct;       /* bms/capacity    (0~100) — 驱动原始值，用于异常检测 */
+    int  bat_cap_pct;       /* battery/capacity(0~100) — Android 显示值，写入目标   */
+    int  raw_pct;           /* capacity_raw    (0~100)                                */
+    int  soc_decimal;       /* soc_decimal (0~10000, 0.1%) raw失效后备选              */
+    int  volt_mv;           /* voltage_now     (mV)                                   */
+    char charging[16];      /* status 字符串                                          */
 } SensorData;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -212,7 +213,9 @@ static int read_sensors(SensorData *s)
     if (sysfs_read_int(SYS_SOC_DECIMAL, &s->soc_decimal) != 0)
         s->soc_decimal = -1;
 
-    if (sysfs_read_int(SYS_CAPACITY, &s->cap_pct) != 0) return -1;
+    if (sysfs_read_int(SYS_CAPACITY, &s->bms_cap_pct) != 0) return -1;
+
+    if (sysfs_read_int(SYS_BAT_CAPACITY, &s->bat_cap_pct) != 0) return -1;
 
     if (sysfs_read_str(SYS_STATUS, s->charging, sizeof(s->charging)) != 0)
         strcpy(s->charging, "Unknown");
@@ -232,19 +235,26 @@ static int read_sensors(SensorData *s)
 static int detect_anomaly(const SensorData *s)
 {
     /* 检查1：系统报极低电量，但电压健康 */
-    if (s->cap_pct <= CAP_MAX_ANOMALY && s->volt_mv >= VOLT_MIN_HEALTHY) {
+    if (s->bms_cap_pct <= CAP_MAX_ANOMALY && s->volt_mv >= VOLT_MIN_HEALTHY) {
         if (s->raw_pct >= RAW_MIN_OK)
             return 1;   /* 类型A：raw 可信 */
         else
             return 2;   /* 类型B：raw 也坏了 */
     }
 
-    /* 检查2：raw 接近 0 但电压很高 → raw 损坏 */
-    if (s->raw_pct <= RAW_BAD_THRESHOLD && s->volt_mv >= VOLT_MIN_HEALTHY)
+    /* 检查2：raw 接近 0 但电压很高 → raw 损坏
+     *         前提：系统读数明显高于 raw（两者不一致才判异常） */
+    if (s->raw_pct <= RAW_BAD_THRESHOLD
+        && s->volt_mv >= VOLT_MIN_HEALTHY
+        && s->bms_cap_pct > RAW_BAD_THRESHOLD)
         return 2;
 
-    /* 检查3：系统与 raw 偏差 >30% */
-    if (abs(s->cap_pct - s->raw_pct) > 30)
+    /* 检查2b：raw 极低（≤1%）且电压健康 → 无论如何 raw 已损坏 */
+    if (s->raw_pct <= 1 && s->volt_mv >= VOLT_MIN_HEALTHY)
+        return 2;
+
+    /* 检查3：系统与 raw 偏差 >3% → raw 更可信 */
+    if (abs(s->bms_cap_pct - s->raw_pct) > 3)
         return 1;
 
     return 0;
@@ -353,8 +363,8 @@ static State state_init(const SensorData *s)
     LOG("║  bat_capacity_correct 服务启动         ║");
     LOG("║  三步策略: 检测 → 恢复 → 兜底         ║");
     LOG("╚════════════════════════════════════════╝");
-    LOG("初始读数: 系统=%d%%  raw=%d%%  电压=%dmV  充电=%s",
-        s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
+    LOG("初始读数: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV  status=%s",
+        s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv, s->charging);
 
     if (type == 0) {
         LOG("检测结果: 无异常 → 进入 NORMAL 状态（后台巡检）");
@@ -379,8 +389,8 @@ static State state_normal(const SensorData *s)
     int type = detect_anomaly(s);
 
     if (type != 0) {
-        LOG("*** 巡检发现异常！系统=%d%%  raw=%d%%  电压=%dmV ***",
-            s->cap_pct, s->raw_pct, s->volt_mv);
+        LOG("*** 巡检发现异常！capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV ***",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv);
         LOG("*** 异常类型: %s → 进入兜底 ***",
             type == 2 ? "类型B→soc/电压估算" : "类型A→raw兜底");
         if (type == 2) {
@@ -393,8 +403,8 @@ static State state_normal(const SensorData *s)
     }
 
     /* 无异常：打印巡检结果，等待下一次 */
-    LOG("巡检: [系统=%d%%  raw=%d%%  电压=%dmV  %s  检测=正常]",
-        s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
+    LOG("巡检: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  soc_decimal=%d  voltage_now=%dmV  status=%s  |  检测=正常  |  不写入",
+        s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->soc_decimal, s->volt_mv, s->charging);
     sleep(NORMAL_POLL_SEC);
     return STATE_NORMAL;
 }
@@ -439,8 +449,8 @@ static State state_recovering(SensorData *s)
     }
 
     int type = detect_anomaly(s);
-    LOG("恢复后读数: 系统=%d%%  raw=%d%%  电压=%dmV  充电=%s",
-        s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
+    LOG("恢复后读数: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d%%  voltage_now=%dmV  status=%s",
+        s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->volt_mv, s->charging);
 
     /* 重置 phase 以便下次进入时从 0 开始 */
     phase = 0;
@@ -468,11 +478,11 @@ static State state_fallback_raw(const SensorData *s)
     sprintf(cur_val, "%d", s->raw_pct);
 
     if (write_capacity(cur_val) == 0) {
-        LOG("写入: %s%%  [系统=%d%%  raw=%d  电压=%dmV  %s  raw兜底] ✓",
-            cur_val, s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
+        LOG("写入: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d  soc_decimal=%d  voltage_now=%dmV  status=%s  |  检测=类型A  |  raw兜底  |  →%s%% ✓",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->soc_decimal, s->volt_mv, s->charging, cur_val);
     } else {
-        LOG("写入: %s%%  [系统=%d%%  raw=%d  电压=%dmV  %s  raw兜底] ✗",
-            cur_val, s->cap_pct, s->raw_pct, s->volt_mv, s->charging);
+        LOG("写入: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d  soc_decimal=%d  voltage_now=%dmV  status=%s  |  检测=类型A  |  raw兜底  |  →%s%% ✗",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->soc_decimal, s->volt_mv, s->charging, cur_val);
     }
 
     /* 检查异常是否已自行消失 */
@@ -505,13 +515,11 @@ static State state_fallback_soc(const SensorData *s)
     sprintf(cur_val, "%d", soc);
 
     if (write_capacity(cur_val) == 0) {
-        LOG("写入: %s%%  [系统=%d%%  raw=%d  soc_decimal=%d  %s  soc兜底] ✓",
-            cur_val, s->cap_pct, s->raw_pct,
-            s->soc_decimal, s->charging);
+        LOG("写入: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d  soc_decimal=%d  voltage_now=%dmV  status=%s  |  检测=类型B  |  soc兜底  |  →%s%% ✓",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->soc_decimal, s->volt_mv, s->charging, cur_val);
     } else {
-        LOG("写入: %s%%  [系统=%d%%  raw=%d  soc_decimal=%d  %s  soc兜底] ✗",
-            cur_val, s->cap_pct, s->raw_pct,
-            s->soc_decimal, s->charging);
+        LOG("写入: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d  soc_decimal=%d  voltage_now=%dmV  status=%s  |  检测=类型B  |  soc兜底  |  →%s%% ✗",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->soc_decimal, s->volt_mv, s->charging, cur_val);
     }
 
     /* 检查是否可以升级 */
@@ -590,13 +598,11 @@ static State state_fallback_voltage(const SensorData *s)
 
     /* ── 4. 写入（每次循环都尝试，不跳过） ──────────────────── */
     if (write_capacity(cur_val) == 0) {
-        LOG("写入: %s%%  [系统=%d%%  raw=%d  %dmV→平滑%dmV→约束  %s  电压] ✓",
-            cur_val, s->cap_pct, s->raw_pct,
-            s->volt_mv, volt_smooth, s->charging);
+        LOG("写入: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d  soc_decimal=%d  voltage_now=%dmV  status=%s  |  检测=类型B  |  电压估算  |  →%s%% ✓",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->soc_decimal, s->volt_mv, s->charging, cur_val);
     } else {
-        LOG("写入: %s%%  [系统=%d%%  raw=%d  %dmV→平滑%dmV→约束  %s  电压] ✗",
-            cur_val, s->cap_pct, s->raw_pct,
-            s->volt_mv, volt_smooth, s->charging);
+        LOG("写入: capacity_bms=%d%%  capacity_bat=%d%%  capacity_raw=%d  soc_decimal=%d  voltage_now=%dmV  status=%s  |  检测=类型B  |  电压估算  |  →%s%% ✗",
+            s->bms_cap_pct, s->bat_cap_pct, s->raw_pct, s->soc_decimal, s->volt_mv, s->charging, cur_val);
     }
 
     /* 检查是否可升级 */
@@ -694,11 +700,6 @@ int main(void)
                     choice = "电压估算";
                     state = state_fallback_voltage(&sensor);
                 }
-                LOG("本轮: 系统=%d%%  raw=%d  soc=%d  电压=%dmV  %s  → 检测=%s  → 选择=%s",
-                    sensor.cap_pct, sensor.raw_pct, sensor.soc_decimal,
-                    sensor.volt_mv, sensor.charging,
-                    t == 0 ? "正常" : t == 1 ? "类型A(raw可信)" : "类型B(raw坏)",
-                    choice);
             }
             break;
         }
