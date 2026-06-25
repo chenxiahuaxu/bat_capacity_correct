@@ -550,39 +550,46 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
 }
 
 /*
- * OCV 平滑 + IR 补偿 + 校准子步
- *   volt_smooth: EMA (α=0.1) 平滑后的端电压
- *   discharge_ocv: 放电轻载时跟踪的 OCV 基准
- *   charge_offset / charge_base_ma: 充电 IR 偏移基准 (首帧 |I|≥250mA 时捕获)
- *   volt_for_ocv: IR 修正后的电压, 用于 OCV 校准
+ * ocv_step — 电压估值与校准（纯电压运算, 最后一步才转 SOC）
  *
- *   初始化：
- *     - 启动后首次 |I|<250mA 且放电 → 电压查表一次性全量初始化
+ * 数据流:
+ *   volt_mv (传感器原始电压)
+ *     ├→ EMA 平滑 → volt_smooth
+ *     ├→ 放电轻载 → discharge_ocv (真实 OCV 基准——充电上浮误差的参照物)
+ *     ├→ 充电 IR 补偿 → volt_for_ocv
+ *     └→ 校准比较 → 修正 coulomb_soc
  *
- *   校准规则：
- *     - |I| < 250mA        → 立刻校准, weight=100%, cap ±2%
- *     - |I| ≥ 250mA        → 仅当距上次校准 ≥120s 时触发强校,
- *                            weight=250*100/|I|(电流越大衰减越强), cap ±2%
+ * 静态变量说明:
+ *   initialized      — 启动后是否已完成首次低负载全量初始化
+ *   discharge_ocv    — 放电轻载时 EMA 跟踪的 OCV 基准 (mV)
+ *   charge_offset    — 充电 IR 压降捕获值 (mV)
+ *   charge_base_ma   — 捕获 IR 时的电流 (mA)
+ *   last_ocv_cal     — 上次校准时间 (用于 120s 强制校准)
+ *   was_charging     — 上一帧的充放电状态 (检测切换)
+ *   ir_captured      — 本充电周期是否已捕获 IR
+ *
+ * 校准: 仅在最终写入前, 通过 voltage_to_capacity() 查表一次。
  */
 static void ocv_step(int volt_mv, int i_ma, int is_charging,
                      int *coulomb_soc,   int *volt_smooth,
                      int *volt_for_ocv,  const char **trust)
 {
-    static int initialized      = 0;
-    static int discharge_ocv    = 0;
-    static int charge_offset    = 0;
-    static int charge_base_ma   = 0;
-    static time_t last_ocv_cal  = 0;
-    static int was_charging     = -1;
+    static int initialized      = 0;  /* 启动后是否已完成首次低负载全量初始化 */
+    static int discharge_ocv    = 0;  /* 放电轻载时 EMA 跟踪的 OCV 基准 (mV)  */
+    static int charge_offset    = 0;  /* 充电 IR 压降捕获值 (mV)              */
+    static int charge_base_ma   = 0;  /* 捕获 IR 时的充电电流 (mA)            */
+    static time_t last_ocv_cal  = 0;  /* 上次校准时间 (用于 120s 强制校准)     */
+    static int was_charging     = -1; /* 上一帧充放电状态 (-1=首帧)           */
 
+    /* ══════════════════ 阶段 A: EMA 平滑 + OCV 基准跟踪 ══════════════════ */
 
-    /* EMA 平滑电压 */
+    /* A1. 端电压 EMA 平滑 (α=0.1, 抑制噪声) */
     if (*volt_smooth == 0)
         *volt_smooth = volt_mv;
     else
         *volt_smooth = (*volt_smooth * 9 + volt_mv) / 10;  /* α=0.1 */
 
-    /* 放电轻载时更新 OCV 基准 */
+    /* A2. 放电轻载时: 用 EMA 电压更新 OCV 基准 (|I|<250mA 且放电) */
     if (i_ma < 250 && !is_charging) {
         if (discharge_ocv == 0)
             discharge_ocv = *volt_smooth;
@@ -590,16 +597,14 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
             discharge_ocv = (discharge_ocv * 9 + *volt_smooth) / 10;
     }
 
-    /* 进入充电时标记等待 IR 捕获 */
-    if (was_charging == 0 && is_charging && discharge_ocv > 0) {
-        /* 不在瞬态捕获，等电流上升到 meaningful 再捕获 */
-    }
-    /* 充放电切换时重置 EMA，避免电压滞后 */
+    /* ══════════════════ 阶段 B: 充放电切换 + IR 捕获 ══════════════════ */
+
+    /* B1. 充放电切换时: 重置 EMA 为当前电压, 避免滞后 */
     if (was_charging != -1 && was_charging != is_charging)
         *volt_smooth = volt_mv;
     was_charging = is_charging;
 
-    /* 首个有效充电帧：捕获 IR（仅当电流 ≥250mA，有意义的内阻测量） */
+    /* B2. IR 捕获: 充电首帧 |I|≥250mA 时记录 IR 压降 ≈ 内阻 */
     static int ir_captured = 0;
     if (!is_charging)
         ir_captured = 0;
@@ -612,14 +617,17 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         }
     }
 
-    /* IR 修正后的虚拟 OCV：偏移随当前电流同比缩放 */
+    /* ══════════════════ 阶段 C: IR 补偿 (去除充电上浮误差) ═══════════════ */
+
+    /* IR 修正: 充电时 volt_for_ocv = 端电压 - IR压降, 近似真实 OCV */
     *volt_for_ocv = *volt_smooth;
     if (is_charging && charge_offset > 0 && charge_base_ma > 0) {
         int dynamic_offset = charge_offset * i_ma / charge_base_ma;
         *volt_for_ocv = *volt_smooth - dynamic_offset;
     }
 
-    /* ── 启动后首次低负载：一次性全量初始化电量 ────── */
+    /* ══════════════════ 阶段 D: 启动首次初始化 ══════════════════ */
+    /* 等待第一次放电低负载 → 一次性全量初始化 coulomb_soc + discharge_ocv */
     if (!initialized) {
         if (i_ma < 250 && !is_charging) {
             *coulomb_soc = voltage_to_capacity(*volt_smooth);
@@ -631,30 +639,40 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         return;  /* 初始化完成前，不执行后续校准 */
     }
 
-    /* ── 后续校准 ────────────────────────────────── */
-    if (i_ma < 250) {
-        /* 低电流：立刻校准，无冷却 */
+    /* ══════════════════ 阶段 E: 运行期校准 ══════════════════ */
+    /* 放电低电流→立刻 | 其余→60s 定时 (充电用 discharge_ocv, 电流衰减) */
+    if (i_ma < 250 && !is_charging) {
+        /* 放电低电流：立刻校准 */
         int ocv_soc = voltage_to_capacity(*volt_for_ocv);
         int delta   = ocv_soc - *coulomb_soc;
         int correction = delta;  /* weight=100, 不衰减 */
         if (correction > 2)  correction = 2;
         if (correction < -2) correction = -2;
+        LOG("  校准: cal=%dmV(volt_f_ocv) → ocv=%d%%  coulomb=%d%%  delta=%d  corr=%+d%%",
+            *volt_for_ocv, ocv_soc, *coulomb_soc, delta, correction);
         *coulomb_soc += correction;
         last_ocv_cal = time(NULL);
         *trust = "校准";
-    } else if (time(NULL) - last_ocv_cal >= 120) {
-        /* 高电流且 120s 无校准 → 强校 */
-        int ocv_soc = voltage_to_capacity(*volt_for_ocv);
+    } else if (time(NULL) - last_ocv_cal >= 60) {
+        /* 60s 定时校准：充电时用 discharge_ocv 去除上浮误差 */
+        int cal_volt = *volt_for_ocv;
+        const char *src = "volt_f_ocv";
+        if (is_charging && discharge_ocv > 0 && discharge_ocv < *volt_for_ocv) {
+            cal_volt = discharge_ocv;
+            src = "discharge_ocv";
+        }
+        int ocv_soc = voltage_to_capacity(cal_volt);
         int delta   = ocv_soc - *coulomb_soc;
-        /* 电流越大修正越小 */
         int weight = 250 * 100 / (i_ma > 0 ? i_ma : 1);
         if (weight > 100) weight = 100;
         int correction = delta * weight / 100;
         if (correction > 2)  correction = 2;
         if (correction < -2) correction = -2;
+        LOG("  校准: cal=%dmV(%s) → ocv=%d%%  coulomb=%d%%  delta=%d  weight=%d  corr=%+d%%",
+            cal_volt, src, ocv_soc, *coulomb_soc, delta, weight, correction);
         *coulomb_soc += correction;
         last_ocv_cal = time(NULL);
-        *trust = "强校";
+        *trust = "校准";
     }
 }
 
@@ -700,7 +718,19 @@ static int constrain_step(int est_raw, int is_charging, int force_reset)
     return est;
 }
 
-/* ── STATE_FALLBACK_VOLTAGE（编排器） ──────────────────────── */
+/*
+ * state_fallback_voltage — 电压估算编排器 (每 3s 一轮)
+ *
+ * 四步流水线:
+ *   1. coulomb_step   → 电荷积分, 更新 coulomb_soc
+ *   2. ocv_step       → EMA + OCV基准 + 校准 (可能修改 coulomb_soc)
+ *   3. constrain_step → 单向约束 (充电不降, 放电不升)
+ *   4. 写入           → est → sysfs battery/capacity
+ *
+ * 静态变量:
+ *   coulomb_soc  — 库仑计跟踪的 SOC%, 整个模块的核心状态
+ *   volt_smooth  — EMA 平滑端电压 (mV), 跨帧保持
+ */
 static State state_fallback_voltage(const SensorData *s)
 {
     static int coulomb_soc    = -1;     /* 库仑计 SOC         */
