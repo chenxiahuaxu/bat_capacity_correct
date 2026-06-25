@@ -52,7 +52,11 @@
  *
  *   主循环: 每 3s 一轮 FALLBACK_VOLTAGE 流水线
  *     Step 1: 库仑计数  (coulomb_step)  — SOC 空间积分
- *     Step 2: OCV 估算 + 校准  (ocv_step)  — 对比修正库仑
+ *     Step 2: EMA + OCV 基准  (ema_smooth, track_ocv)
+ *     Step 3: 首次初始化      (try_init)
+ *     Step 4: IR 补偿         (ir_compensate)
+ *     Step 5: OCV 校准        (ocv_calibrate)
+ *     Step 6: 信任标签 + 单向约束 + 写入
  *     Step 3: 单向约束  (constrain_step)
  *     Step 4: 写入 sysfs  (voltage_to_capacity 查表一次)
  *
@@ -642,85 +646,67 @@ static void ir_compensate(int volt_mv, int i_ma, int is_charging,
     }
 }
 
-/*
- * ocv_step — 电压估值与校准（纯电压运算, 最后一步才转 SOC）
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EMA 平滑
  *
- * 数据流:
- *   volt_mv (传感器原始电压)
- *     ├→ EMA 平滑 → volt_smooth
- *     ├→ 放电轻载 → discharge_ocv (真实 OCV 基准——充电上浮误差的参照物)
- *     ├→ 充电 IR 补偿 → volt_for_ocv
- *     └→ 校准比较 → 修正 coulomb_soc
- *
- * 静态变量说明:
- *   initialized      — 启动后是否已完成首次低负载全量初始化
- *   discharge_ocv    — 放电轻载时 EMA 跟踪的 OCV 基准 (mV)
- *   last_ocv_cal     — 上次校准时间 (用于 60s 定时校准)
- *
- * (内阻管理 + EMA 重置 见 ir_compensate)
- * 校准: 仅在最终写入前, 通过 voltage_to_capacity() 查表一次。
+ * 所有后续步骤的基础。α=0.1, 抑制瞬时噪声。
  */
-static void ocv_step(int volt_mv, int i_ma, int is_charging,
-                     int *coulomb_soc,   int *volt_smooth,
-                     int *volt_for_ocv,  const char **trust)
+static void ema_smooth(int volt_mv, int *volt_smooth)
 {
-    static int initialized      = 0;  /* 启动后是否已完成首次低负载全量初始化 */
-    static int discharge_ocv    = 0;  /* 放电轻载时 EMA 跟踪的 OCV 基准 (mV)  */
-    static time_t last_ocv_cal  = 0;  /* 上次校准时间 (用于 60s 定时校准)     */
-
-    /* ══════════════════ 阶段 A: EMA 平滑 + OCV 基准跟踪 ══════════════════ */
-
-    /* A1. 端电压 EMA 平滑 (α=0.1, 抑制噪声) */
     if (*volt_smooth == 0)
         *volt_smooth = volt_mv;
     else
-        *volt_smooth = (*volt_smooth * 9 + volt_mv) / 10;  /* α=0.1 */
+        *volt_smooth = (*volt_smooth * 9 + volt_mv) / 10;
+}
 
-    /* A2. 放电轻载时: 用 EMA 电压更新 OCV 基准 (|I|<250mA 且放电) */
+/*
+ * track_ocv — OCV 基准跟踪
+ *
+ * 放电 |I|<250mA 时持续 EMA 跟踪 volt_smooth, 作为真实开路电压的近似。
+ * 充电和高电流放电时用作内阻计算参照。
+ */
+static void track_ocv(int i_ma, int is_charging, int volt_smooth, int *discharge_ocv)
+{
     if (i_ma < 250 && !is_charging) {
-        if (discharge_ocv == 0)
-            discharge_ocv = *volt_smooth;
+        if (*discharge_ocv == 0)
+            *discharge_ocv = volt_smooth;
         else
-            discharge_ocv = (discharge_ocv * 9 + *volt_smooth) / 10;
+            *discharge_ocv = (*discharge_ocv * 9 + volt_smooth) / 10;
     }
+}
 
-    /* ══════════════════ 阶段 B: 内阻管理 + IR 补偿 (见 ir_compensate) ══ */
-    ir_compensate(volt_mv, i_ma, is_charging, volt_smooth, volt_for_ocv, discharge_ocv);
-
-    /* ══════════════════ 阶段 C: 启动首次初始化 ══════════════════ */
-    /* 等待第一次放电低负载 (|I|<500mA) → 一次性全量初始化 */
-    if (!initialized) {
-        if (i_ma < 500 && !is_charging) {
-            *coulomb_soc = voltage_to_capacity(*volt_smooth);
-            discharge_ocv = *volt_smooth;
-            initialized = 1;
-            last_ocv_cal = time(NULL);
-            *trust = "初始化";
-        }
-        return;  /* 初始化完成前，不执行后续校准 */
-    }
-
-    /* ══════════════════ 阶段 D: 运行期校准 ══════════════════ */
-    /* 放电低电流→立刻 | 其余→60s 定时 (充电用 discharge_ocv, 电流衰减) */
+/*
+ * ocv_calibrate — 用 OCV 估算值校准库仑计
+ *
+ * 两路:
+ *   放电低电流 (|I|<250mA) → 立刻校准, weight=100%
+ *   其余 → 60s 定时校准, weight=250*100/|I| (电流衰减)
+ *
+ * 校准电压: volt_for_ocv (IR 补偿后), 被 IR 压低时兜底 discharge_ocv。
+ */
+static void ocv_calibrate(int i_ma, int is_charging,
+                          int volt_for_ocv, int discharge_ocv,
+                          int *coulomb_soc, time_t *last_ocv_cal,
+                          const char **trust)
+{
     if (i_ma < 250 && !is_charging) {
         /* 放电低电流：立刻校准 */
-        int ocv_soc = voltage_to_capacity(*volt_for_ocv);
+        int ocv_soc = voltage_to_capacity(volt_for_ocv);
         int delta   = ocv_soc - *coulomb_soc;
-        int correction = delta;  /* weight=100, 不衰减 */
+        int correction = delta;
         if (correction > 2)  correction = 2;
         if (correction < -2) correction = -2;
         LOG("  校准: cal=%dmV(volt_f_ocv) → ocv=%d%%  coulomb=%d%%  delta=%d  corr=%+d%%",
-            *volt_for_ocv, ocv_soc, *coulomb_soc, delta, correction);
+            volt_for_ocv, ocv_soc, *coulomb_soc, delta, correction);
         *coulomb_soc += correction;
-         last_ocv_cal = time(NULL);
+        *last_ocv_cal = time(NULL);
         *trust = "校准";
-    } else if (time(NULL) - last_ocv_cal >= 60) {
-        /* 60s 定时校准：放电/充电端电压被 IR 压低时用 discharge_ocv 兜底 */
-        int cal_volt = *volt_for_ocv;
+    } else if (time(NULL) - *last_ocv_cal >= 60) {
+        /* 60s 定时校准：端电压被 IR 压低时用 discharge_ocv 兜底 */
+        int cal_volt = volt_for_ocv;
         const char *src = "volt_f_ocv";
-
-        if (discharge_ocv > 0 && *volt_for_ocv < discharge_ocv) {
-            cal_volt = discharge_ocv;  /* 端电压被 IR 压低, 用 OCV 基准 */
+        if (discharge_ocv > 0 && volt_for_ocv < discharge_ocv) {
+            cal_volt = discharge_ocv;
             src = "discharge_ocv";
         }
         int ocv_soc = voltage_to_capacity(cal_volt);
@@ -733,7 +719,7 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         LOG("  校准: cal=%dmV(%s) → ocv=%d%%  coulomb=%d%%  delta=%d  weight=%d  corr=%+d%%",
             cal_volt, src, ocv_soc, *coulomb_soc, delta, weight, correction);
         *coulomb_soc += correction;
-        last_ocv_cal = time(NULL);
+        *last_ocv_cal = time(NULL);
         *trust = "校准";
     }
 }
@@ -783,11 +769,13 @@ static int constrain_step(int est_raw, int is_charging, int force_reset)
 /*
  * state_fallback_voltage — 电压估算编排器 (每 3s 一轮)
  *
- * 四步流水线:
- *   1. coulomb_step   → 电荷积分, 更新 coulomb_soc
- *   2. ocv_step       → EMA + OCV基准 + 校准 (可能修改 coulomb_soc)
- *   3. constrain_step → 单向约束 (充电不降, 放电不升)
- *   4. 写入           → est → sysfs battery/capacity
+ * 六步流水线:
+ *   1. coulomb_step     → 电荷积分, 更新 coulomb_soc
+ *   2. try_init         → 首次低负载初始化 (一次性, 用原始电压)
+ *   3. try_init         → 首次低负载初始化 (一次性)
+ *   4. ir_compensate    → 统一内阻 IR 补偿
+ *   5. ocv_calibrate    → OCV 校准 (可能修改 coulomb_soc)
+ *   6. 信任标签 + 约束 + 写入
  *
  * 静态变量:
  *   coulomb_soc  — 库仑计跟踪的 SOC%, 整个模块的核心状态
@@ -795,45 +783,56 @@ static int constrain_step(int est_raw, int is_charging, int force_reset)
  */
 static State state_fallback_voltage(const SensorData *s)
 {
-    static int coulomb_soc    = -1;     /* 库仑计 SOC         */
-    static int volt_smooth    = 0;      /* EMA 平滑电压       */
+    static int coulomb_soc       = -1;     /* 库仑计 SOC         */
+    static int volt_smooth       = 0;      /* EMA 平滑电压       */
+    static int initialized       = 0;      /* 是否已完成首次初始化 */
+    static int discharge_ocv     = 0;      /* OCV 基准 (mV)       */
+    static time_t last_ocv_cal   = 0;      /* 上次校准时间         */
     char  cur_val[16];
     int   is_charging, i_ma, est;
     const char *trust = NULL;
 
     /* 充放电判断 */
-    is_charging = (s->charging[0] == 'C' || s->charging[0] == 'c');
+    is_charging = (strstr(s->charging, "Charging") || strstr(s->charging, "charging"));
     i_ma = abs(s->current_ua) / 1000;
 
-    /* 充放电切换时重置——通过 constrain_step 内部的静态 cap_constrained 完成 */
-    static int prev_chg_for_constraint = -1;
-    if (prev_chg_for_constraint != -1 && prev_chg_for_constraint != is_charging) {
-        /* cap_constrained 在 constrain_step 内部, 这里不需要显式重置 */
+    /* ── 1. 首次初始化 (通过前不执行任何操作) ────────────────── */
+    if (!initialized) {
+        if (i_ma < 500 && !is_charging) {
+            coulomb_soc = voltage_to_capacity(s->volt_mv);
+            discharge_ocv = s->volt_mv;
+            last_ocv_cal = time(NULL);
+            trust = "初始化";
+            initialized = 1;
+        }
+        return STATE_FALLBACK_VOLTAGE;
     }
-    prev_chg_for_constraint = is_charging;
 
-    /* ── 1. 库仑计数 ────────────────────────────────────────── */
+    /* ── 2. 库仑计数 ────────────────────────────────────────── */
     coulomb_step(s->current_ua, s->volt_mv, &coulomb_soc);
 
-    /* ── 2. OCV 平滑 + IR 补偿 + 校准 ───────────────────────── */
+    /* ── 3. EMA + OCV + IR + 校准 ────────────────────────────── */
+    ema_smooth(s->volt_mv, &volt_smooth);
     int volt_for_ocv;
-    ocv_step(s->volt_mv, i_ma, is_charging,
-             &coulomb_soc, &volt_smooth, &volt_for_ocv, &trust);
+    track_ocv(i_ma, is_charging, volt_smooth, &discharge_ocv);
+    ir_compensate(s->volt_mv, i_ma, is_charging, &volt_smooth, &volt_for_ocv, discharge_ocv);
+    ocv_calibrate(i_ma, is_charging, volt_for_ocv, discharge_ocv,
+                  &coulomb_soc, &last_ocv_cal, &trust);
 
-    /* 未触发校准/微调时, 按电流分级设置信任标签 */
+    /* ── 4. 信任标签 ────────────────────────────────────────── */
     if (trust == NULL) {
         if (i_ma < CUR_HIGH_TRUST)      trust = "高";
         else if (i_ma < CUR_MED_TRUST)  trust = "中";
         else                            trust = "低";
     }
 
-    /* ── 3. 单向约束 ────────────────────────────────────────── */
+    /* ── 7. 单向约束 ────────────────────────────────────────── */
     if (trust && strcmp(trust, "初始化") == 0)
-        est = constrain_step(coulomb_soc, is_charging, 1);  /* 强制接受初始化值 */
+        est = constrain_step(coulomb_soc, is_charging, 1);
     else
         est = constrain_step(coulomb_soc, is_charging, 0);
 
-    /* ── 4. 写入 ────────────────────────────────────────────── */
+    /* ── 8. 写入 ────────────────────────────────────────────── */
     sprintf(cur_val, "%d", est);
     int ok = (write_capacity(cur_val) == 0);
 
