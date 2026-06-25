@@ -695,19 +695,20 @@ static int track_ocv(int i_ma, int is_charging, int volt_smooth, int *discharge_
  * 校准电压: volt_for_ocv (IR 补偿后), 被 IR 压低时兜底 discharge_ocv。
  */
 static void ocv_calibrate(int i_ma, int is_charging,
-                          int volt_for_ocv, int discharge_ocv,
+                          int volt_for_ocv, int volt_mv,
+int discharge_ocv,
                           int *coulomb_soc, time_t *last_ocv_cal,
                           const char **trust)
 {
     if (i_ma < 250 && !is_charging) {
-        /* 放电低电流：立刻校准 */
-        int ocv_soc = voltage_to_capacity(volt_for_ocv);
+        /* 放电低电流: 用瞬时电压 (无 EMA 滞后, |I|小→端压≈OCV) */
+        int ocv_soc = voltage_to_capacity(volt_mv);
         int delta   = ocv_soc - *coulomb_soc;
         int correction = delta;
         if (correction > 2)  correction = 2;
         if (correction < -2) correction = -2;
-        LOG("  校准: cal=%dmV(volt_f_ocv) → ocv=%d%%  coulomb=%d%%  delta=%d  corr=%+d%%",
-            volt_for_ocv, ocv_soc, *coulomb_soc, delta, correction);
+        LOG("  校准: cal=%dmV(volt_inst) → ocv=%d%%  coulomb=%d%%  delta=%d  corr=%+d%%",
+            volt_mv, ocv_soc, *coulomb_soc, delta, correction);
         *coulomb_soc += correction;
         *last_ocv_cal = time(NULL);
         *trust = "校准";
@@ -832,7 +833,7 @@ static State state_fallback_voltage(const SensorData *s)
     int volt_for_ocv;
     int ocv_fresh = track_ocv(i_ma, is_charging, volt_smooth, &discharge_ocv);
     ir_compensate(s->volt_mv, i_ma, is_charging, &volt_smooth, &volt_for_ocv, discharge_ocv, ocv_fresh);
-    ocv_calibrate(i_ma, is_charging, volt_for_ocv, discharge_ocv,
+    ocv_calibrate(i_ma, is_charging, volt_for_ocv, s->volt_mv, discharge_ocv,
                   &coulomb_soc, &last_ocv_cal, &trust);
 
     /* ── 4. 信任标签 ────────────────────────────────────────── */
