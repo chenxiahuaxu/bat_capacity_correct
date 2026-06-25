@@ -1,21 +1,62 @@
 /*
  * bat_capacity_correct.c — 多阶段电池电量校正
  *
- * 状态机 / 状态机：
- *   INIT              → 初始检测，判定进入 NORMAL 或兜底
- *   NORMAL            → 无异常，只后台定时巡检，不写任何 sysfs
- *   RECOVERING        → 尝试恢复控制器（暂不使用）
- *   FALLBACK_RAW      → raw 可信：raw/100 覆写 battery/capacity
- *   FALLBACK_VOLTAGE  → raw 无效：电压查表估算覆写
+ * ── 设计原理 ──────────────────────────────────────────────────────────────
  *
- * 电压估算策略 / 电压估算策略：
- *   电流置信度指数平滑：
- *     |I| < 200mA  → 高置信，全量更新 EMA
- *     200 ≤ |I| < 500mA → 中置信，半量更新
- *     |I| ≥ 500mA → 低置信，不更新，保持上一条估计值
+ * 核心问题: 部分Android设备在第三方 ROM 下, BMS 的 capacity_raw 恒为 0,
+ *          系统电量卡在 1-4%。需要纯软件的方案替代硬件电量计。
  *
- * 核心原则：轻载时电压可信度高，重载/快充时电流越大可信度越低。
- * 写入目标：/sys/class/power_supply/battery/capacity（Android 读取的节点）
+ * 两条腿走路:
+ *   (1) 库仑计数 (Coulomb counter) — 积分电流, 跟踪相对变化量。
+ *       基于电荷守恒定律: SOC(t) = SOC(t0) - (1/C_rated) ∫ I·dt
+ *       不受电压噪声影响, 高频准确; 但会随时间和传感器误差缓慢漂移。
+ *
+ *   (2) OCV 校准 (Open Circuit Voltage) — 用电压查表, 修正绝对位置。
+ *       放电低负载时, 端电压 ≈ 开路电压 (OCV), 通过 OCV-SOC 曲线
+ *       可独立估算 SOC。低频准确, 用来校准库仑计数累积的漂移。
+ *
+ *   两者互补: 库仑快而漂, OCV 慢而准。标准电量计 (TI/ADI/MPS) 均为此架构。
+ *
+ * OCV 校准时机:
+ *   放电低电流 (|I|<250mA) — 立刻触发, 端电压 ≈ OCV, 最可靠。
+ *   充电 — 端电压被 IR 压升, 不可直接使用。
+ *         需先通过内阻 R 计算 IR 压降扣掉, 再校准。但 IR 压降估算有误差,
+ *         故充电时改用 60s 定时触发, 并用 discharge_ocv(上次放电极的 OCV 基准)兜底。
+ *   放电高电流 — 端电压被 IR 压低, 需通过内阻补回。
+ *
+ * 内阻 R 的计算:
+ *   充放共用同一内阻 (物理上相同)。在 |I|≥500mA 时,
+ *   用 stop_lt_smooth 与 discharge_ocv 的差值除以当前电流, EMA 平滑后
+ *   作为统一内阻值。充电扣 IR, 放电补 IR。
+ *
+ * OCV 基准 (discharge_ocv):
+ *   放电 |I|<250mA 时持续 EMA 跟踪, 是系统中最接近真实开路电压的值。
+ *   充电时用作兜底电压; 放电高电流时用作内阻计算参照。
+ *
+ * 单向约束:
+ *   物理上, 充电 SOC 只升不降, 放电只降不升。防止 KPI 突变。
+ *   初始化帧时强制重置约束, 接受首次低负载 OCV 全量写入。
+ *
+ * 电压表的使用:
+ *   OCV→SOC 查表仅在最写入时调用一次, 中间所有运算都在 SOC% 或 mV 空间。
+ *
+ * ── 状态机 ────────────────────────────────────────────────────────────────
+ *
+ *   INIT              → 等待 10s BMS 初始化 → 检测进入 NORMAL 或兜底
+ *   NORMAL            → 无异常, 后台巡检 (boot 异常时持续同步)
+ *   RECOVERING        → 尝试恢复控制器 (暂不启用)
+ *   FALLBACK_RAW      → raw/100 覆写 battery/capacity
+ *   FALLBACK_VOLTAGE  → 库仑计数 + OCV 校准, 核心路径
+ *
+ * ── 数据处理 ──────────────────────────────────────────────────────────────
+ *
+ *   主循环: 每 3s 一轮 FALLBACK_VOLTAGE 流水线
+ *     Step 1: 库仑计数  (coulomb_step)  — SOC 空间积分
+ *     Step 2: OCV 估算 + 校准  (ocv_step)  — 对比修正库仑
+ *     Step 3: 单向约束  (constrain_step)
+ *     Step 4: 写入 sysfs  (voltage_to_capacity 查表一次)
+ *
+ * ──────────────────────────────────────────────────────────────────────────
  */
 
 #include <stdio.h>
@@ -552,14 +593,22 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
 /*
  * ir_compensate — 统一内阻管理
  *
+ * 原理:
+ *   锂电池内阻 R 是物理定值, 充电放电相同。
+ *   充电时端电压 = OCV + IR, 放电时端电压 = OCV - IR。
+ *   已知 R 和 |I|, 即可从端电压恢复出近似 OCV。
+ *
+ * R 的计算:
+ *   |I|≥500mA 时, 用 |volt_smooth - discharge_ocv| / |I| 估算 R,
+ *   阈值 20mV 过滤噪声, EMA(α=0.1) 平滑。
+ *
  * 两个职责:
  *   1. 充放电切换时重置 EMA, 避免电压滞后
- *   2. |I|≥500mA 时用电压差更新内阻 EMA, 补偿到 volt_for_ocv
- *      (充电扣掉 IR 压降, 放电补回 IR 压降)
+ *   2. 用 R 补偿端电压: 充电扣掉 IR 压降, 放电补回 IR 压降
  *
  * 静态变量:
- *   r_mohm       — EMA 内阻 (mΩ), 充放共用
- *   was_charging — 上一帧充放电状态
+ *   r_mohm       — EMA 内阻 (mΩ), 充放共用, R=0 时不做补偿(由校准兜底)
+ *   was_charging — 上一帧充放电状态 (检测切换)
  */
 static void ir_compensate(int volt_mv, int i_ma, int is_charging,
                           int *volt_smooth, int *volt_for_ocv,
