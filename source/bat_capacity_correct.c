@@ -562,11 +562,9 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
  * 静态变量说明:
  *   initialized      — 启动后是否已完成首次低负载全量初始化
  *   discharge_ocv    — 放电轻载时 EMA 跟踪的 OCV 基准 (mV)
- *   charge_offset    — 充电 IR 压降捕获值 (mV)
- *   charge_base_ma   — 捕获 IR 时的电流 (mA)
- *   last_ocv_cal     — 上次校准时间 (用于 120s 强制校准)
+ *   r_mohm           — 统一内阻 EMA (mΩ), 充放共用
+ *   last_ocv_cal     — 上次校准时间 (用于 60s 定时校准)
  *   was_charging     — 上一帧的充放电状态 (检测切换)
- *   ir_captured      — 本充电周期是否已捕获 IR
  *
  * 校准: 仅在最终写入前, 通过 voltage_to_capacity() 查表一次。
  */
@@ -576,8 +574,7 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
 {
     static int initialized      = 0;  /* 启动后是否已完成首次低负载全量初始化 */
     static int discharge_ocv    = 0;  /* 放电轻载时 EMA 跟踪的 OCV 基准 (mV)  */
-    static int charge_offset    = 0;  /* 充电 IR 压降捕获值 (mV)              */
-    static int charge_base_ma   = 0;  /* 捕获 IR 时的充电电流 (mA)            */
+    static int r_mohm           = 0;  /* 统一内阻 EMA (mΩ), 充放共用            */
     static time_t last_ocv_cal  = 0;  /* 上次校准时间 (用于 120s 强制校准)     */
     static int was_charging     = -1; /* 上一帧充放电状态 (-1=首帧)           */
 
@@ -597,33 +594,32 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
             discharge_ocv = (discharge_ocv * 9 + *volt_smooth) / 10;
     }
 
-    /* ══════════════════ 阶段 B: 充放电切换 + IR 捕获 ══════════════════ */
+    /* ══════════════════ 阶段 B: 充放电切换 + 统一内阻 ══════════════════ */
 
     /* B1. 充放电切换时: 重置 EMA 为当前电压, 避免滞后 */
     if (was_charging != -1 && was_charging != is_charging)
         *volt_smooth = volt_mv;
     was_charging = is_charging;
 
-    /* B2. IR 捕获: 充电首帧 |I|≥250mA 时记录 IR 压降 ≈ 内阻 */
-    static int ir_captured = 0;
-    if (!is_charging)
-        ir_captured = 0;
-    if (is_charging && !ir_captured && i_ma >= 250 && discharge_ocv > 0) {
-        int offset = volt_mv - discharge_ocv;
-        if (offset > 0) {
-            charge_offset  = offset;
-            charge_base_ma = i_ma;
-            ir_captured = 1;
+    /* B2. 统一内阻 EMA: |I|≥500mA 且电压差 >20mV 时计算 (充放共用) */
+    if (i_ma >= 500 && discharge_ocv > 0) {
+        int dv = abs(*volt_smooth - discharge_ocv);
+        if (dv > 20) {
+            int r = dv * 1000 / i_ma;               /* mV→mΩ */
+            r_mohm = (r_mohm == 0) ? r : (r_mohm * 9 + r) / 10;  /* EMA α=0.1 */
         }
     }
 
-    /* ══════════════════ 阶段 C: IR 补偿 (去除充电上浮误差) ═══════════════ */
+    /* ══════════════════ 阶段 C: IR 补偿 (充放统一) ═══════════════ */
 
-    /* IR 修正: 充电时 volt_for_ocv = 端电压 - IR压降, 近似真实 OCV */
+    /* 充电端电压偏高→扣掉IR压降, 放电端电压偏低→补回IR压降 */
     *volt_for_ocv = *volt_smooth;
-    if (is_charging && charge_offset > 0 && charge_base_ma > 0) {
-        int dynamic_offset = charge_offset * i_ma / charge_base_ma;
-        *volt_for_ocv = *volt_smooth - dynamic_offset;
+    if (r_mohm > 0) {
+        int ir_mv = r_mohm * i_ma / 1000;           /* mΩ × mA → mV */
+        if (is_charging)
+            *volt_for_ocv -= ir_mv;
+        else
+            *volt_for_ocv += ir_mv;
     }
 
     /* ══════════════════ 阶段 D: 启动首次初始化 ══════════════════ */
@@ -651,15 +647,15 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         LOG("  校准: cal=%dmV(volt_f_ocv) → ocv=%d%%  coulomb=%d%%  delta=%d  corr=%+d%%",
             *volt_for_ocv, ocv_soc, *coulomb_soc, delta, correction);
         *coulomb_soc += correction;
-        last_ocv_cal = time(NULL);
+         last_ocv_cal = time(NULL);
         *trust = "校准";
     } else if (time(NULL) - last_ocv_cal >= 60) {
-        /* 60s 定时校准：volt_for_ocv 为主, IR 补偿过度时兜底 discharge_ocv */
+        /* 60s 定时校准：放电/充电端电压被 IR 压低时用 discharge_ocv 兜底 */
         int cal_volt = *volt_for_ocv;
         const char *src = "volt_f_ocv";
 
-        if (is_charging && discharge_ocv > 0 && *volt_for_ocv < discharge_ocv) {
-            cal_volt = discharge_ocv;  /* IR 补偿过度时兜底 */
+        if (discharge_ocv > 0 && *volt_for_ocv < discharge_ocv) {
+            cal_volt = discharge_ocv;  /* 端电压被 IR 压低, 用 OCV 基准 */
             src = "discharge_ocv";
         }
         int ocv_soc = voltage_to_capacity(cal_volt);
