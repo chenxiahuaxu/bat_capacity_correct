@@ -627,9 +627,9 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
     }
 
     /* ══════════════════ 阶段 D: 启动首次初始化 ══════════════════ */
-    /* 等待第一次放电低负载 → 一次性全量初始化 coulomb_soc + discharge_ocv */
+    /* 等待第一次放电低负载 (|I|<500mA) → 一次性全量初始化 */
     if (!initialized) {
-        if (i_ma < 250 && !is_charging) {
+        if (i_ma < 500 && !is_charging) {
             *coulomb_soc = voltage_to_capacity(*volt_smooth);
             discharge_ocv = *volt_smooth;
             initialized = 1;
