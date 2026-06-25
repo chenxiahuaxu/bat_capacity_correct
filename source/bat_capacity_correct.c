@@ -805,6 +805,7 @@ static State state_fallback_voltage(const SensorData *s)
             trust = "初始化";
             initialized = 1;
         }
+        sleep(FALLBACK_POLL_SEC);
         return STATE_FALLBACK_VOLTAGE;
     }
 
