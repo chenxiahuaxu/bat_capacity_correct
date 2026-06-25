@@ -654,11 +654,12 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         last_ocv_cal = time(NULL);
         *trust = "校准";
     } else if (time(NULL) - last_ocv_cal >= 60) {
-        /* 60s 定时校准：充电时用 discharge_ocv 去除上浮误差 */
+        /* 60s 定时校准：volt_for_ocv 为主, IR 补偿过度时兜底 discharge_ocv */
         int cal_volt = *volt_for_ocv;
         const char *src = "volt_f_ocv";
-        if (is_charging && discharge_ocv > 0 && discharge_ocv < *volt_for_ocv) {
-            cal_volt = discharge_ocv;
+
+        if (is_charging && discharge_ocv > 0 && *volt_for_ocv < discharge_ocv) {
+            cal_volt = discharge_ocv;  /* IR 补偿过度时兜底 */
             src = "discharge_ocv";
         }
         int ocv_soc = voltage_to_capacity(cal_volt);
