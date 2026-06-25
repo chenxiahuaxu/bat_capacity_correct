@@ -793,7 +793,7 @@ static State state_fallback_voltage(const SensorData *s)
     const char *trust = NULL;
 
     /* 充放电判断 */
-    is_charging = (strstr(s->charging, "Charging") || strstr(s->charging, "charging"));
+    is_charging = (strcmp(s->charging, "Charging") == 0);
     i_ma = abs(s->current_ua) / 1000;
 
     /* ── 1. 首次初始化 (通过前不执行任何操作) ────────────────── */
@@ -804,6 +804,11 @@ static State state_fallback_voltage(const SensorData *s)
             last_ocv_cal = time(NULL);
             trust = "初始化";
             initialized = 1;
+            LOG("初始化成功: volt=%dmV → coulomb=%d%%  discharge_ocv=%dmV",
+                s->volt_mv, coulomb_soc, discharge_ocv);
+        } else {
+            LOG("等待初始化: |I|=%dmA  charging=%d  status=%s",
+                i_ma, is_charging, s->charging);
         }
         sleep(FALLBACK_POLL_SEC);
         return STATE_FALLBACK_VOLTAGE;
