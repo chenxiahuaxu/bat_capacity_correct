@@ -550,6 +550,50 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
 }
 
 /*
+ * ir_compensate — 统一内阻管理
+ *
+ * 两个职责:
+ *   1. 充放电切换时重置 EMA, 避免电压滞后
+ *   2. |I|≥500mA 时用电压差更新内阻 EMA, 补偿到 volt_for_ocv
+ *      (充电扣掉 IR 压降, 放电补回 IR 压降)
+ *
+ * 静态变量:
+ *   r_mohm       — EMA 内阻 (mΩ), 充放共用
+ *   was_charging — 上一帧充放电状态
+ */
+static void ir_compensate(int volt_mv, int i_ma, int is_charging,
+                          int *volt_smooth, int *volt_for_ocv,
+                          int discharge_ocv)
+{
+    static int r_mohm       = 0;
+    static int was_charging = -1;
+
+    /* 充放电切换时重置 EMA, 避免滞后 */
+    if (was_charging != -1 && was_charging != is_charging)
+        *volt_smooth = volt_mv;
+    was_charging = is_charging;
+
+    /* 统一内阻 EMA: |I|≥500mA 且电压差 >20mV 时计算 */
+    if (i_ma >= 500 && discharge_ocv > 0) {
+        int dv = abs(*volt_smooth - discharge_ocv);
+        if (dv > 20) {
+            int r = dv * 1000 / i_ma;               /* mV→mΩ */
+            r_mohm = (r_mohm == 0) ? r : (r_mohm * 9 + r) / 10;
+        }
+    }
+
+    /* IR 补偿: 充电扣掉, 放电补回 */
+    *volt_for_ocv = *volt_smooth;
+    if (r_mohm > 0) {
+        int ir_mv = r_mohm * i_ma / 1000;           /* mΩ × mA → mV */
+        if (is_charging)
+            *volt_for_ocv -= ir_mv;
+        else
+            *volt_for_ocv += ir_mv;
+    }
+}
+
+/*
  * ocv_step — 电压估值与校准（纯电压运算, 最后一步才转 SOC）
  *
  * 数据流:
@@ -562,10 +606,9 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
  * 静态变量说明:
  *   initialized      — 启动后是否已完成首次低负载全量初始化
  *   discharge_ocv    — 放电轻载时 EMA 跟踪的 OCV 基准 (mV)
- *   r_mohm           — 统一内阻 EMA (mΩ), 充放共用
  *   last_ocv_cal     — 上次校准时间 (用于 60s 定时校准)
- *   was_charging     — 上一帧的充放电状态 (检测切换)
  *
+ * (内阻管理 + EMA 重置 见 ir_compensate)
  * 校准: 仅在最终写入前, 通过 voltage_to_capacity() 查表一次。
  */
 static void ocv_step(int volt_mv, int i_ma, int is_charging,
@@ -574,9 +617,7 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
 {
     static int initialized      = 0;  /* 启动后是否已完成首次低负载全量初始化 */
     static int discharge_ocv    = 0;  /* 放电轻载时 EMA 跟踪的 OCV 基准 (mV)  */
-    static int r_mohm           = 0;  /* 统一内阻 EMA (mΩ), 充放共用            */
-    static time_t last_ocv_cal  = 0;  /* 上次校准时间 (用于 120s 强制校准)     */
-    static int was_charging     = -1; /* 上一帧充放电状态 (-1=首帧)           */
+    static time_t last_ocv_cal  = 0;  /* 上次校准时间 (用于 60s 定时校准)     */
 
     /* ══════════════════ 阶段 A: EMA 平滑 + OCV 基准跟踪 ══════════════════ */
 
@@ -594,35 +635,10 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
             discharge_ocv = (discharge_ocv * 9 + *volt_smooth) / 10;
     }
 
-    /* ══════════════════ 阶段 B: 充放电切换 + 统一内阻 ══════════════════ */
+    /* ══════════════════ 阶段 B: 内阻管理 + IR 补偿 (见 ir_compensate) ══ */
+    ir_compensate(volt_mv, i_ma, is_charging, volt_smooth, volt_for_ocv, discharge_ocv);
 
-    /* B1. 充放电切换时: 重置 EMA 为当前电压, 避免滞后 */
-    if (was_charging != -1 && was_charging != is_charging)
-        *volt_smooth = volt_mv;
-    was_charging = is_charging;
-
-    /* B2. 统一内阻 EMA: |I|≥500mA 且电压差 >20mV 时计算 (充放共用) */
-    if (i_ma >= 500 && discharge_ocv > 0) {
-        int dv = abs(*volt_smooth - discharge_ocv);
-        if (dv > 20) {
-            int r = dv * 1000 / i_ma;               /* mV→mΩ */
-            r_mohm = (r_mohm == 0) ? r : (r_mohm * 9 + r) / 10;  /* EMA α=0.1 */
-        }
-    }
-
-    /* ══════════════════ 阶段 C: IR 补偿 (充放统一) ═══════════════ */
-
-    /* 充电端电压偏高→扣掉IR压降, 放电端电压偏低→补回IR压降 */
-    *volt_for_ocv = *volt_smooth;
-    if (r_mohm > 0) {
-        int ir_mv = r_mohm * i_ma / 1000;           /* mΩ × mA → mV */
-        if (is_charging)
-            *volt_for_ocv -= ir_mv;
-        else
-            *volt_for_ocv += ir_mv;
-    }
-
-    /* ══════════════════ 阶段 D: 启动首次初始化 ══════════════════ */
+    /* ══════════════════ 阶段 C: 启动首次初始化 ══════════════════ */
     /* 等待第一次放电低负载 (|I|<500mA) → 一次性全量初始化 */
     if (!initialized) {
         if (i_ma < 500 && !is_charging) {
@@ -635,7 +651,7 @@ static void ocv_step(int volt_mv, int i_ma, int is_charging,
         return;  /* 初始化完成前，不执行后续校准 */
     }
 
-    /* ══════════════════ 阶段 E: 运行期校准 ══════════════════ */
+    /* ══════════════════ 阶段 D: 运行期校准 ══════════════════ */
     /* 放电低电流→立刻 | 其余→60s 定时 (充电用 discharge_ocv, 电流衰减) */
     if (i_ma < 250 && !is_charging) {
         /* 放电低电流：立刻校准 */
