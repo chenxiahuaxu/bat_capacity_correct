@@ -616,7 +616,7 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
  */
 static void ir_compensate(int volt_mv, int i_ma, int is_charging,
                           int *volt_smooth, int *volt_for_ocv,
-                          int discharge_ocv)
+                          int discharge_ocv, int force_r)
 {
     static int r_mohm       = 0;
     static int was_charging = -1;
@@ -625,6 +625,12 @@ static void ir_compensate(int volt_mv, int i_ma, int is_charging,
     if (was_charging != -1 && was_charging != is_charging)
         *volt_smooth = volt_mv;
     was_charging = is_charging;
+
+    /* 初始化时强制设置内阻 */
+    if (force_r > 0 && r_mohm == 0) {
+        r_mohm = force_r;
+        LOG("内阻: 初始化强制 R=%dmΩ", r_mohm);
+    }
 
     /* 统一内阻: |I|≥500mA 且放电时微调 (步长限 ±50mΩ 防抖) */
     if (!is_charging && i_ma >= 500 && discharge_ocv > 0) {
@@ -798,6 +804,9 @@ static State state_fallback_voltage(const SensorData *s)
     static int volt_smooth       = 0;      /* EMA 平滑电压       */
     static int initialized       = 0;      /* 是否已完成首次初始化 */
     static int discharge_ocv     = 0;      /* OCV 基准 (mV)       */
+    static int hi_v              = 0;      /* 等待期 ≥500mA 时的电压 */
+    static int hi_i              = 0;      /* 对应电流              */
+    static int init_r            = 0;      /* 初始化后强制设 R     */
     static time_t last_ocv_cal   = 0;      /* 上次校准时间         */
     char  cur_val[16];
     int   is_charging, i_ma, est;
@@ -812,12 +821,23 @@ static State state_fallback_voltage(const SensorData *s)
 
     /* ── 1. 首次初始化 (通过前不执行任何操作) ────────────────── */
     if (!initialized) {
-        if (i_ma < 500 && !is_charging) {
+        /* 等待期: 记录最后一次 ≥500mA 的电压, 用于初始化时算 R */
+        if (i_ma >= 500 && !is_charging) {
+            hi_v = s->volt_mv;  /* 用瞬时电压, 不用 EMA */
+            hi_i = i_ma;
+        }
+        if (i_ma < 300 && !is_charging) {
             coulomb_soc = voltage_to_capacity(s->volt_mv);
             discharge_ocv = s->volt_mv;
             last_ocv_cal = time(NULL);
             trust = "初始化";
             initialized = 1;
+            /* 用等待期记录的 ≥500mA 数据立即计算 R */
+            if (hi_v > 0 && hi_i > 0) {
+                init_r = abs(hi_v - discharge_ocv) * 1000 / hi_i;
+                LOG("初始化时计算 R: hi_v=%dmV  ocv=%dmV  |I|=%dmA → R=%dmΩ",
+                    hi_v, discharge_ocv, hi_i, init_r);
+            }
             LOG("初始化成功: volt=%dmV → coulomb=%d%%  discharge_ocv=%dmV",
                 s->volt_mv, coulomb_soc, discharge_ocv);
         } else {
@@ -834,7 +854,8 @@ static State state_fallback_voltage(const SensorData *s)
     /* ── 3. OCV + IR + 校准 ──────────────────────────────────── */
     int volt_for_ocv;
     track_ocv(i_ma, is_charging, volt_smooth, &discharge_ocv);
-    ir_compensate(s->volt_mv, i_ma, is_charging, &volt_smooth, &volt_for_ocv, discharge_ocv);
+    ir_compensate(s->volt_mv, i_ma, is_charging, &volt_smooth, &volt_for_ocv, discharge_ocv, init_r);
+    init_r = 0;
     ocv_calibrate(i_ma, is_charging, volt_for_ocv, s->volt_mv, discharge_ocv,
                   &coulomb_soc, &last_ocv_cal, &trust);
 
