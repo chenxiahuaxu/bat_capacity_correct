@@ -616,7 +616,7 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
  */
 static void ir_compensate(int volt_mv, int i_ma, int is_charging,
                           int *volt_smooth, int *volt_for_ocv,
-                          int discharge_ocv)
+                          int discharge_ocv, int ocv_fresh)
 {
     static int r_mohm       = 0;
     static int was_charging = -1;
@@ -626,11 +626,17 @@ static void ir_compensate(int volt_mv, int i_ma, int is_charging,
         *volt_smooth = volt_mv;
     was_charging = is_charging;
 
-    /* 统一内阻 EMA: |I|≥500mA 且电压差 >20mV 时计算 */
-    if (i_ma >= 500 && discharge_ocv > 0) {
+    /* 统一内阻: 只在 OCV 刚刷新时微调, 避免滞旧值导致 R 剧烈波动 */
+    if (ocv_fresh && i_ma >= 500 && discharge_ocv > 0) {
         int dv = abs(*volt_smooth - discharge_ocv);
         if (dv > 20) {
             int r = dv * 1000 / i_ma;               /* mV→mΩ */
+            if (r_mohm > 0) {
+                int delta = r - r_mohm;
+                if (delta >  50) delta =  50;
+                if (delta < -50) delta = -50;
+                r = r_mohm + delta;
+            }
             r_mohm = (r_mohm == 0) ? r : (r_mohm * 9 + r) / 10;
         }
     }
@@ -643,6 +649,8 @@ static void ir_compensate(int volt_mv, int i_ma, int is_charging,
             *volt_for_ocv -= ir_mv;
         else
             *volt_for_ocv += ir_mv;
+        LOG("IR: smooth=%dmV  R=%dmΩ  |I|=%dmA  ir=%+dmV → v_f_ocv=%dmV",
+            *volt_smooth, r_mohm, i_ma, is_charging ? -ir_mv : ir_mv, *volt_for_ocv);
     }
 }
 
@@ -665,14 +673,16 @@ static void ema_smooth(int volt_mv, int *volt_smooth)
  * 放电 |I|<250mA 时持续 EMA 跟踪 volt_smooth, 作为真实开路电压的近似。
  * 充电和高电流放电时用作内阻计算参照。
  */
-static void track_ocv(int i_ma, int is_charging, int volt_smooth, int *discharge_ocv)
+static int track_ocv(int i_ma, int is_charging, int volt_smooth, int *discharge_ocv)
 {
     if (i_ma < 250 && !is_charging) {
         if (*discharge_ocv == 0)
             *discharge_ocv = volt_smooth;
         else
             *discharge_ocv = (*discharge_ocv * 9 + volt_smooth) / 10;
+        return 1;
     }
+    return 0;
 }
 
 /*
@@ -820,8 +830,8 @@ static State state_fallback_voltage(const SensorData *s)
     /* ── 3. EMA + OCV + IR + 校准 ────────────────────────────── */
     ema_smooth(s->volt_mv, &volt_smooth);
     int volt_for_ocv;
-    track_ocv(i_ma, is_charging, volt_smooth, &discharge_ocv);
-    ir_compensate(s->volt_mv, i_ma, is_charging, &volt_smooth, &volt_for_ocv, discharge_ocv);
+    int ocv_fresh = track_ocv(i_ma, is_charging, volt_smooth, &discharge_ocv);
+    ir_compensate(s->volt_mv, i_ma, is_charging, &volt_smooth, &volt_for_ocv, discharge_ocv, ocv_fresh);
     ocv_calibrate(i_ma, is_charging, volt_for_ocv, discharge_ocv,
                   &coulomb_soc, &last_ocv_cal, &trust);
 
