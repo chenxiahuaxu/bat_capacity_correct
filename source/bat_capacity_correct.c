@@ -36,6 +36,7 @@
 #define SYS_CURRENT_NOW   "/sys/class/power_supply/bms/current_now"
 #define SYS_STATUS        "/sys/class/power_supply/battery/status"
 #define SYS_BMS_RESET     "/sys/class/power_supply/bms/reset"
+#define SYS_CHARGE_FULL   "/sys/class/power_supply/bms/charge_full_design"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 阈值
@@ -183,7 +184,8 @@ static int sysfs_write_str(const char *path, const char *val)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static FILE *g_fp_cap = NULL;
-static int   g_boot_abnormal = 0;  /* 启动时 BMS 异常则置 1，NORMAL 状态下也需持续覆写 */
+static int     g_boot_abnormal  = 0;
+static int64_t g_uas_per_pct    = 173520000LL;  /* 默认 4820000µAh */
 
 /* 写 capacity 节点 — 仿原始方案：保持 fd 打开，fprintf + fflush */
 static int write_capacity(const char *val)
@@ -520,14 +522,12 @@ static State state_fallback_raw(const SensorData *s)
  *     2. OCV 校准：空闲时用开路电压修正库仑计累积误差
  *     3. 电流越大，库仑计数权重越高；电流越小，OCV 校准越活跃
  */
-/* ── 库仑计参数（宏放函数外以便子函数引用） ──────── */
-#define CHARGE_FULL_UAH 4820000LL
-#define UAS_PER_PCT     (CHARGE_FULL_UAH * 36LL)  /* µA·s per 1% SOC */
+/* ── 库仑计: 每 1% SOC 对应 µA·s = charge_full_design(µAh) × 36 */
 
 /*
  * 库仑计数子步
  *   原理: SOC 变化量 = 累计电流×时间 / 电池满容量
- *     UAS_PER_PCT = 4820000 µAh × 36 = 173,520,000 µA·s (每 1% SOC 对应的电荷量)
+ *     g_uas_per_pct = charge_full_design(µAh) × 36 (每 1% SOC 对应的电荷量)
  *     例: 2000mA 充电, 每 3s 累计 6,000,000 µA·s → 约 29 轮(87s) 才变化 1%
  *         500mA 充电, 每 3s 累计 1,500,000 µA·s → 约 116 轮(348s) 才变化 1%
  */
@@ -540,10 +540,10 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
         coulomb_acc = 0;
     }
     coulomb_acc += (int64_t)current_ua * FALLBACK_POLL_SEC;
-    int soc_delta = (int)(coulomb_acc / UAS_PER_PCT);
+    int soc_delta = (int)(coulomb_acc / g_uas_per_pct);
     if (soc_delta != 0) {
         *coulomb_soc -= soc_delta;  /* 正电流=放电, SOC 递减; 负=充电, 递增 */
-        coulomb_acc -= (int64_t)soc_delta * UAS_PER_PCT;
+        coulomb_acc -= (int64_t)soc_delta * g_uas_per_pct;
     }
     if (*coulomb_soc < 0)   *coulomb_soc = 0;
     if (*coulomb_soc > 100) *coulomb_soc = 100;
@@ -800,6 +800,15 @@ int main(void)
         return 1;
     }
     LOG("已打开 capacity 写入句柄 (%s)", SYS_BAT_CAPACITY);
+
+    /* 动态读取电池满容量 (µAh) → 计算每 1% SOC 对应的 µA·s */
+    {
+        int full_uah = 0;
+        if (sysfs_read_int(SYS_CHARGE_FULL, &full_uah) == 0 && full_uah > 0) {
+            g_uas_per_pct = (int64_t)full_uah * 36LL;
+            LOG("电池容量: %d µAh → Coulomb: %lld µA·s/%%", full_uah, (long long)g_uas_per_pct);
+        }
+    }
 
     /* 首次读取传感器 */
     if (read_sensors(&sensor) != 0) {
