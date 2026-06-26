@@ -737,14 +737,14 @@ static void ema_smooth(int volt_mv, int *volt_smooth)
  * 放电 |I|<250mA 时持续 EMA 跟踪 volt_smooth, 作为真实开路电压的近似。
  * 充电和高电流放电时用作内阻计算参照。
  */
-static void track_ocv(int i_ma, int is_charging, int volt_smooth, int *discharge_ocv)
+static void track_ocv(int i_ma, int is_charging, int volt_for_ocv, int *discharge_ocv)
 {
-    /* 放电时持续更新 (含高电流), 避免长时间冻结 */
+    /* 放电时持续更新 (用 IR 补偿后的真实 OCV) */
     if (!is_charging) {
         if (*discharge_ocv == 0)
-            *discharge_ocv = volt_smooth;
+            *discharge_ocv = volt_for_ocv;
         else
-            *discharge_ocv = (*discharge_ocv * 9 + volt_smooth) / 10;
+            *discharge_ocv = (*discharge_ocv * 9 + volt_for_ocv) / 10;
     }
 }
 
