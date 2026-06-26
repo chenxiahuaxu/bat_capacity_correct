@@ -739,7 +739,8 @@ static void ema_smooth(int volt_mv, int *volt_smooth)
  */
 static void track_ocv(int i_ma, int is_charging, int volt_smooth, int *discharge_ocv)
 {
-    if (i_ma < 250 && !is_charging) {
+    /* 放电时持续更新 (含高电流), 避免长时间冻结 */
+    if (!is_charging) {
         if (*discharge_ocv == 0)
             *discharge_ocv = volt_smooth;
         else
@@ -907,11 +908,11 @@ static State state_fallback_voltage(const SensorData *s)
     /* ── 2. 库仑计数 ────────────────────────────────────────── */
     coulomb_step(s->current_ua, s->volt_mv, &coulomb_soc);
 
-    /* ── 3. OCV + IR + 校准 ──────────────────────────────────── */
+    /* ── 3. IR + OCV + 校准 ──────────────────────────────────── */
     int volt_for_ocv;
-    track_ocv(i_ma, is_charging, volt_smooth, &discharge_ocv);
     ir_compensate(s->volt_mv, i_ma, is_charging, &volt_smooth, &volt_for_ocv, discharge_ocv, init_r);
     init_r = 0;
+    track_ocv(i_ma, is_charging, volt_for_ocv, &discharge_ocv);
     ocv_calibrate(i_ma, is_charging, volt_for_ocv, s->volt_mv, discharge_ocv,
                   &coulomb_soc, &last_ocv_cal, &trust);
 
