@@ -659,6 +659,7 @@ static void ir_compensate(int volt_mv, int i_ma, int is_charging,
     static int r_chg[R_BINS];
     static int r_dchg[R_BINS];
     static int was_charging = -1;
+    static int last_vocv     = 0;   /* 上一帧 v_f_ocv, 防突变 */
 
     /* EMA 重置: 充放电切换 / 电压突变 >30mV */
     if (was_charging != -1 && was_charging != is_charging)
@@ -675,11 +676,11 @@ static void ir_compensate(int volt_mv, int i_ma, int is_charging,
         LOG("内阻: 初始化强制 R[%s][%d]=%dmΩ", is_charging?"chg":"dchg", bin, r[bin]);
     }
 
-    /* 分档内阻更新: dv > 10mV 时计算, 充放均可 */
-    if (discharge_ocv > 0) {
+    /* 分档内阻更新: |I|≥200mA 且 dv>100mV (过低电流 dv 为噪声) */
+    if (discharge_ocv > 0 && i_ma >= 200) {
         int *r = is_charging ? r_chg : r_dchg;
         int dv = abs(volt_mv - discharge_ocv);
-        if (dv > 10) {
+        if (dv > 100) {
             update_r(r, bin, dv, i_ma);
             LOG("放电内阻: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
                 r_dchg[0],r_dchg[1],r_dchg[2],r_dchg[3],r_dchg[4],
@@ -707,6 +708,14 @@ static void ir_compensate(int volt_mv, int i_ma, int is_charging,
                 *volt_smooth, r_use, bin, i_ma, is_charging ? -ir_mv : ir_mv, *volt_for_ocv);
         }
     }
+
+    /* v_f_ocv 单帧变化 >20mV → 限幅, 防瞬态冲击 */
+    if (last_vocv > 0) {
+        int delta = *volt_for_ocv - last_vocv;
+        if (delta >  20) { *volt_for_ocv = last_vocv + 20; LOG("v_f_ocv 限幅: %+dmV",  20); }
+        if (delta < -20) { *volt_for_ocv = last_vocv - 20; LOG("v_f_ocv 限幅: %+dmV", -20); }
+    }
+    last_vocv = *volt_for_ocv;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -760,7 +769,7 @@ static void ocv_calibrate(int i_ma, int is_charging,
         int correction = delta;
         if (correction > 0)  correction = 0;  /* 放电只降不升 */
         if (correction < -1) correction = -1;
-        LOG("  校准: cal=%dmV(volt_inst) → ocv=%d%%  coulomb=%d%%  delta=%d  corr=%+d%%",
+        LOG("校准: cal=%dmV(volt_inst) → ocv=%d%%  coulomb=%d%%  delta=%d  corr=%+d%%",
             volt_mv, ocv_soc, *coulomb_soc, delta, correction);
         *coulomb_soc += correction;
         *last_ocv_cal = time(NULL);
