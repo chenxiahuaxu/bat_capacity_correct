@@ -607,58 +607,105 @@ static void coulomb_step(int current_ua, int volt_mv, int *coulomb_soc)
  *   阈值 20mV 过滤噪声, EMA(α=0.1) 平滑。
  *
  * 两个职责:
- *   1. 充放电切换时重置 EMA, 避免电压滞后
- *   2. 用 R 补偿端电压: 充电扣掉 IR 压降, 放电补回 IR 压降
+ *   1. EMA 重置 (充放电切换 / 电压突变 >30mV)
+ *   2. 分档内阻: 充放分离, 每 500mA 一档, 就近查找, 线性插值
  *
  * 静态变量:
- *   r_mohm       — EMA 内阻 (mΩ), 充放共用, R=0 时不做补偿(由校准兜底)
- *   was_charging — 上一帧充放电状态 (检测切换)
+ *   r_chg[5], r_dchg[5] — 分档内阻 (mΩ)
+ *   was_charging        — 上一帧充放电状态
  */
+#define R_BINS 20
+
+/* 电流 → 档位 (500mA/档) */
+static int bin_of(int i_ma) {
+    int b = i_ma / 500;
+    return (b >= R_BINS) ? R_BINS - 1 : b;
+}
+
+/* 查找/写入档位 b 的内阻: 命中→返回; 插值→写入并返回; 缺→最近 */
+static int lookup_r(int *r, int b)
+{
+    if (r[b] > 0) return r[b];
+    int lo = -1, hi = -1;
+    for (int i = b; i >= 0     && lo < 0; i--) if (r[i] > 0) lo = i;
+    for (int i = b; i < R_BINS && hi < 0; i++) if (r[i] > 0) hi = i;
+    if (lo >= 0 && hi >= 0) {
+        r[b] = r[lo] + (r[hi] - r[lo]) * (b - lo) / (hi - lo);  /* 插值写入 */
+        return r[b];
+    }
+    if (lo >= 0) { r[b] = r[lo]; return r[b]; }
+    if (hi >= 0) { r[b] = r[hi]; return r[b]; }
+    return 0;
+}
+
+/* 更新档位 b 的内阻 (EMA, 步长 ±50mΩ) */
+static void update_r(int *r, int b, int dv, int i_ma)
+{
+    int r_new = dv * 1000 / i_ma;
+    if (r[b] == 0) {
+        r[b] = r_new;
+    } else {
+        int delta = r_new - r[b];
+        if (delta >  50) delta =  50;
+        if (delta < -50) delta = -50;
+        r[b] = (r[b] * 9 + (r[b] + delta)) / 10;
+    }
+}
+
 static void ir_compensate(int volt_mv, int i_ma, int is_charging,
                           int *volt_smooth, int *volt_for_ocv,
                           int discharge_ocv, int force_r)
 {
-    static int r_mohm       = 0;
+    static int r_chg[R_BINS];
+    static int r_dchg[R_BINS];
     static int was_charging = -1;
 
-    /* 充放电切换时重置 EMA, 避免滞后 */
+    /* EMA 重置: 充放电切换 / 电压突变 >30mV */
     if (was_charging != -1 && was_charging != is_charging)
         *volt_smooth = volt_mv;
     was_charging = is_charging;
+    if (abs(volt_mv - *volt_smooth) > 30)
+        *volt_smooth = volt_mv;
 
-    /* 初始化时强制设置内阻 */
-    if (force_r > 0 && r_mohm == 0) {
-        r_mohm = force_r;
-        LOG("内阻: 初始化强制 R=%dmΩ", r_mohm);
+    /* 初始化时强制设置对应档位的内阻 */
+    int bin = bin_of(i_ma);
+    if (force_r > 0 && discharge_ocv > 0) {
+        int *r = is_charging ? r_chg : r_dchg;
+        update_r(r, bin, abs(volt_mv - discharge_ocv), i_ma);
+        LOG("内阻: 初始化强制 R[%s][%d]=%dmΩ", is_charging?"chg":"dchg", bin, r[bin]);
     }
 
-    /* 统一内阻: |I|≥500mA 且放电时微调 (步长限 ±50mΩ 防抖) */
-    if (!is_charging && i_ma >= 500 && discharge_ocv > 0) {
-        int dv = abs(*volt_smooth - discharge_ocv);
-        if (dv > 20) {
-            int r = dv * 1000 / i_ma;               /* mV→mΩ */
-            if (r_mohm > 0) {
-                int delta = r - r_mohm;
-                if (delta >  50) delta =  50;
-                if (delta < -50) delta = -50;
-                r = r_mohm + delta;
-            }
-            r_mohm = (r_mohm == 0) ? r : (r_mohm * 9 + r) / 10;
-            LOG("内阻: dv=%dmV  |I|=%dmA  R_raw=%dmΩ → R_ema=%dmΩ",
-                dv, i_ma, dv * 1000 / i_ma, r_mohm);
+    /* 分档内阻更新: dv > 10mV 时计算, 充放均可 */
+    if (discharge_ocv > 0) {
+        int *r = is_charging ? r_chg : r_dchg;
+        int dv = abs(volt_mv - discharge_ocv);
+        if (dv > 10) {
+            update_r(r, bin, dv, i_ma);
+            LOG("放电内阻: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
+                r_dchg[0],r_dchg[1],r_dchg[2],r_dchg[3],r_dchg[4],
+                r_dchg[5],r_dchg[6],r_dchg[7],r_dchg[8],r_dchg[9],
+                r_dchg[10],r_dchg[11],r_dchg[12],r_dchg[13],r_dchg[14],
+                r_dchg[15],r_dchg[16],r_dchg[17],r_dchg[18],r_dchg[19]);
+            LOG("充电内阻: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
+                r_chg[0], r_chg[1], r_chg[2], r_chg[3], r_chg[4],
+                r_chg[5], r_chg[6], r_chg[7], r_chg[8], r_chg[9],
+                r_chg[10],r_chg[11],r_chg[12],r_chg[13],r_chg[14],
+                r_chg[15],r_chg[16],r_chg[17],r_chg[18],r_chg[19]);
         }
     }
 
-    /* IR 补偿: 充电扣掉, 放电补回 */
+    /* IR 补偿: 按档位查找 R */
     *volt_for_ocv = *volt_smooth;
-    if (r_mohm > 0) {
-        int ir_mv = r_mohm * i_ma / 1000;           /* mΩ × mA → mV */
-        if (is_charging)
-            *volt_for_ocv -= ir_mv;
-        else
-            *volt_for_ocv += ir_mv;
-        LOG("IR: smooth=%dmV  R=%dmΩ  |I|=%dmA  ir=%+dmV → v_f_ocv=%dmV",
-            *volt_smooth, r_mohm, i_ma, is_charging ? -ir_mv : ir_mv, *volt_for_ocv);
+    {
+        int *r = is_charging ? r_chg : r_dchg;
+        int r_use = lookup_r(r, bin);
+        if (r_use > 0) {
+            int ir_mv = r_use * i_ma / 1000;
+            if (is_charging) *volt_for_ocv -= ir_mv;
+            else             *volt_for_ocv += ir_mv;
+            LOG("IR: smooth=%dmV  R=%dmΩ(#%d)  |I|=%dmA  ir=%+dmV → v_f_ocv=%dmV",
+                *volt_smooth, r_use, bin, i_ma, is_charging ? -ir_mv : ir_mv, *volt_for_ocv);
+        }
     }
 }
 
