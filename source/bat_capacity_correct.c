@@ -712,7 +712,7 @@ static void ocv_calibrate(int i_ma, int is_charging,
         int delta   = ocv_soc - *coulomb_soc;
         int correction = delta;
         if (correction > 0)  correction = 0;  /* 放电只降不升 */
-        if (correction < -2) correction = -2;
+        if (correction < -1) correction = -1;
         LOG("  校准: cal=%dmV(volt_inst) → ocv=%d%%  coulomb=%d%%  delta=%d  corr=%+d%%",
             volt_mv, ocv_soc, *coulomb_soc, delta, correction);
         *coulomb_soc += correction;
@@ -731,8 +731,8 @@ static void ocv_calibrate(int i_ma, int is_charging,
         int weight = 250 * 100 / (i_ma > 0 ? i_ma : 1);
         if (weight > 100) weight = 100;
         int correction = delta * weight / 100;
-        if (correction > 2)  correction = 2;
-        if (correction < -2) correction = -2;
+        if (correction > 1)   correction = 1;
+        if (correction < -1)  correction = -1;
         LOG("  校准: cal=%dmV(%s) → ocv=%d%%  coulomb=%d%%  delta=%d  weight=%d  corr=%+d%%",
             cal_volt, src, ocv_soc, *coulomb_soc, delta, weight, correction);
         *coulomb_soc += correction;
